@@ -1,0 +1,5 @@
+# botid
+
+```shell
+botid init
+```
