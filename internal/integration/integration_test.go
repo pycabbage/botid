@@ -57,8 +57,9 @@ type result struct {
 	err    error
 }
 
-func (s sandbox) exec(stdin string, name string, args ...string) result {
-	cmd := exec.Command(name, args...)
+func (s sandbox) exec(t *testing.T, stdin string, name string, args ...string) result {
+	t.Helper()
+	cmd := exec.CommandContext(t.Context(), name, args...)
 	cmd.Env = s.env()
 	cmd.Dir = s.home
 	cmd.Stdin = strings.NewReader(stdin)
@@ -71,7 +72,7 @@ func (s sandbox) exec(stdin string, name string, args ...string) result {
 
 func (s sandbox) mustRun(t *testing.T, stdin string, name string, args ...string) string {
 	t.Helper()
-	r := s.exec(stdin, name, args...)
+	r := s.exec(t, stdin, name, args...)
 	if r.err != nil {
 		t.Fatalf("%s %s: %v\nstdout:\n%s\nstderr:\n%s", name, strings.Join(args, " "), r.err, r.stdout, r.stderr)
 	}
@@ -250,7 +251,7 @@ func TestIntegration(t *testing.T) {
 			t.Fatalf("precondition: GitConfigDir must not exist: stat err = %v", err)
 		}
 
-		r := s.exec("", "git", "config", "--global", "user.name", "example-app[bot]")
+		r := s.exec(t, "", "git", "config", "--global", "user.name", "example-app[bot]")
 
 		var exitErr *exec.ExitError
 		if !errors.As(r.err, &exitErr) || exitErr.ExitCode() == 0 {

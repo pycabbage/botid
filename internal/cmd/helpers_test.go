@@ -2,6 +2,7 @@ package cmd_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -115,6 +116,7 @@ type call struct {
 	Env  []string
 	Name string
 	Args []string
+	Ctx  any
 }
 
 func (c call) line() string {
@@ -128,20 +130,20 @@ type recorder struct {
 	out   map[string]string
 }
 
-func (r *recorder) record(env []string, name string, args []string) ([]byte, error) {
-	c := call{Env: env, Name: name, Args: args}
+func (r *recorder) record(ctx context.Context, env []string, name string, args []string) ([]byte, error) {
+	c := call{Env: env, Name: name, Args: args, Ctx: ctx.Value(ctxKey{})}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, c)
 	return []byte(r.out[c.line()]), r.errs[c.line()]
 }
 
-func (r *recorder) exec(env []string, name string, args ...string) ([]byte, error) {
-	return r.record(env, name, args)
+func (r *recorder) exec(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
+	return r.record(ctx, env, name, args)
 }
 
-func (r *recorder) systemctl(name string, args ...string) ([]byte, error) {
-	return r.record(nil, name, args)
+func (r *recorder) systemctl(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return r.record(ctx, nil, name, args)
 }
 
 func (r *recorder) lines() []string {

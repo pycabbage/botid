@@ -1,0 +1,31 @@
+version: 2
+
+builds:
+  - id: botid
+    binary: botid
+    main: .
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+
+archives:
+  - id: botid
+    formats:
+      - tar.gz
+    name_template: "botid_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  # GoReleaser creates a draft, uploads all assets, then publishes it (safe with immutable releases).
+  draft: false
+  prerelease: auto

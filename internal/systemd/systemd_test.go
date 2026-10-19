@@ -1,6 +1,7 @@
 package systemd
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -21,7 +22,7 @@ type recorder struct {
 	out   map[string]string
 }
 
-func (r *recorder) run(name string, args ...string) ([]byte, error) {
+func (r *recorder) run(_ context.Context, name string, args ...string) ([]byte, error) {
 	r.calls = append(r.calls, call{name, args})
 	key := strings.Join(args, " ")
 	return []byte(r.out[key]), r.errs[key]
@@ -55,8 +56,9 @@ func newEnv(t *testing.T) env {
 	}
 }
 
-func (e env) install(run Runner) error {
-	return install(e.home, e.exe, run, e.runDir, e.tempDir)
+func (e env) install(t *testing.T, run Runner) error {
+	t.Helper()
+	return install(t.Context(), e.home, e.exe, run, e.runDir, e.tempDir)
 }
 
 func readFile(t *testing.T, path string) string {
@@ -72,7 +74,7 @@ func TestInstallWritesUnitsAndRunsSystemctlInOrder(t *testing.T) {
 	e := newEnv(t)
 	rec := &recorder{}
 
-	if err := e.install(rec.run); err != nil {
+	if err := e.install(t, rec.run); err != nil {
 		t.Fatal(err)
 	}
 
@@ -111,7 +113,7 @@ func TestInstallWritesUnitsAndRunsSystemctlInOrder(t *testing.T) {
 
 func TestInstallCreatesUnitDirWith0755AndLeavesExistingDirMode(t *testing.T) {
 	e := newEnv(t)
-	if err := e.install((&recorder{}).run); err != nil {
+	if err := e.install(t, (&recorder{}).run); err != nil {
 		t.Fatal(err)
 	}
 	fi, err := os.Stat(e.unitDir)
@@ -129,7 +131,7 @@ func TestInstallCreatesUnitDirWith0755AndLeavesExistingDirMode(t *testing.T) {
 	if err := os.Chmod(e2.unitDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := e2.install((&recorder{}).run); err != nil {
+	if err := e2.install(t, (&recorder{}).run); err != nil {
 		t.Fatal(err)
 	}
 	fi, err = os.Stat(e2.unitDir)
@@ -143,7 +145,7 @@ func TestInstallCreatesUnitDirWith0755AndLeavesExistingDirMode(t *testing.T) {
 
 func TestInstallLeavesNoTempFiles(t *testing.T) {
 	e := newEnv(t)
-	if err := e.install((&recorder{}).run); err != nil {
+	if err := e.install(t, (&recorder{}).run); err != nil {
 		t.Fatal(err)
 	}
 	entries, err := os.ReadDir(e.unitDir)
@@ -164,7 +166,7 @@ func TestInstallEscapesPercent(t *testing.T) {
 	e := newEnv(t)
 	e.exe = filepath.Join(filepath.Dir(e.exe), "100%", "botid")
 
-	if err := e.install((&recorder{}).run); err != nil {
+	if err := e.install(t, (&recorder{}).run); err != nil {
 		t.Fatal(err)
 	}
 
@@ -175,26 +177,44 @@ func TestInstallEscapesPercent(t *testing.T) {
 	}
 }
 
+type unsafeExe struct {
+	exe  string
+	want string
+}
+
+func unsafeExePaths(tempDir string) map[string]unsafeExe {
+	const (
+		notAbsolute = "executable path is not absolute"
+		badChar     = "executable path contains an unusable character"
+		temporary   = "cannot create units from a temporary or go run executable"
+	)
+	return map[string]unsafeExe{
+		"relative path":       {"botid", notAbsolute},
+		"relative path (./)":  {"./botid", notAbsolute},
+		"empty":               {"", notAbsolute},
+		"double quote":        {"/opt/bo\"tid/botid", badChar},
+		"backslash":           {"/opt/bo\\tid/botid", badChar},
+		"dollar sign":         {"/opt/bo$tid/botid", badChar},
+		"newline":             {"/opt/bo\ntid/botid", badChar},
+		"carriage return":     {"/opt/bo\rtid/botid", badChar},
+		"go-build":            {"/home/u/.cache/go-build/ab/botid", temporary},
+		"go-build standalone": {"/var/go-build12/exe/botid", temporary},
+		"under temp dir":      {filepath.Join(tempDir, "botid"), temporary},
+		"nested under temp":   {filepath.Join(tempDir, "a", "b", "botid"), temporary},
+	}
+}
+
 func TestInstallRejectsUnsafeExePaths(t *testing.T) {
 	e := newEnv(t)
-	cases := map[string]string{
-		"relative path":       "botid",
-		"relative path (./)":  "./botid",
-		"empty":               "",
-		"double quote":        "/opt/bo\"tid/botid",
-		"backslash":           "/opt/bo\\tid/botid",
-		"dollar sign":         "/opt/bo$tid/botid",
-		"newline":             "/opt/bo\ntid/botid",
-		"carriage return":     "/opt/bo\rtid/botid",
-		"go-build":            "/home/u/.cache/go-build/ab/botid",
-		"go-build standalone": "/var/go-build12/exe/botid",
-	}
-	for name, exe := range cases {
+	for name, c := range unsafeExePaths(e.tempDir) {
 		t.Run(name, func(t *testing.T) {
 			rec := &recorder{}
-			err := install(e.home, exe, rec.run, e.runDir, e.tempDir)
+			err := install(t.Context(), e.home, c.exe, rec.run, e.runDir, e.tempDir)
 			if err == nil {
-				t.Fatalf("install(%q) succeeded, want error", exe)
+				t.Fatalf("install(%q) succeeded, want error", c.exe)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("install(%q) err = %q, want it to contain %q", c.exe, err, c.want)
 			}
 			if len(rec.calls) != 0 {
 				t.Errorf("systemctl was called: %v", rec.calls)
@@ -215,12 +235,12 @@ func TestInstallRejectsExeUnderTempDir(t *testing.T) {
 		filepath.Join(e.tempDir, "a", "b", "botid"),
 	}
 	for _, exe := range cases {
-		err := install(e.home, exe, rec.run, e.runDir, e.tempDir)
+		err := install(t.Context(), e.home, exe, rec.run, e.runDir, e.tempDir)
 		if err == nil {
 			t.Fatalf("install(%q) succeeded, want error", exe)
 		}
-		if !strings.Contains(err.Error(), "temporary directory") {
-			t.Errorf("err = %q, want temporary directory", err)
+		if !strings.Contains(err.Error(), "cannot create units from a temporary or go run executable") {
+			t.Errorf("err = %q, want the temporary or go run executable error", err)
 		}
 	}
 	if len(rec.calls) != 0 {
@@ -234,7 +254,7 @@ func TestInstallRejectsExeUnderTempDir(t *testing.T) {
 func TestInstallAcceptsSiblingOfTempDirPrefix(t *testing.T) {
 	e := newEnv(t)
 	e.exe = e.tempDir + "-other/botid"
-	if err := e.install((&recorder{}).run); err != nil {
+	if err := e.install(t, (&recorder{}).run); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -244,7 +264,7 @@ func TestInstallRejectsExeUnderRealOSTempDir(t *testing.T) {
 	exe := filepath.Join(os.TempDir(), "botid-test-nonexistent", "botid")
 	rec := &recorder{}
 
-	err := Install(home, exe, rec.run)
+	err := Install(t.Context(), home, exe, rec.run)
 	if err == nil {
 		t.Fatal("Install succeeded, want error")
 	}
@@ -261,7 +281,7 @@ func TestInstallFailsWithoutWritingWhenSystemdIsNotRunning(t *testing.T) {
 	e.runDir = filepath.Join(e.runDir, "missing")
 	rec := &recorder{}
 
-	err := e.install(rec.run)
+	err := e.install(t, rec.run)
 	if err == nil {
 		t.Fatal("install succeeded, want error")
 	}
@@ -271,6 +291,99 @@ func TestInstallFailsWithoutWritingWhenSystemdIsNotRunning(t *testing.T) {
 	if len(rec.calls) != 0 {
 		t.Errorf("systemctl was called: %v", rec.calls)
 	}
+	if _, statErr := os.Stat(filepath.Join(e.home, ".config")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("home was modified (stat err = %v)", statErr)
+	}
+}
+
+func TestPreflightAcceptsAbsolutePathWhenSystemdIsBooted(t *testing.T) {
+	if _, err := os.Stat("/run/systemd/system"); err != nil {
+		t.Skipf("Preflight requires /run/systemd/system: %v", err)
+	}
+	if err := Preflight("/opt/botid/bin/botid"); err != nil {
+		t.Fatalf("Preflight: %v", err)
+	}
+}
+
+func TestPreflightRejectsUnsafeExePaths(t *testing.T) {
+	runDir := t.TempDir()
+	const tempDir = "/tmp"
+	for name, c := range unsafeExePaths(tempDir) {
+		t.Run(name, func(t *testing.T) {
+			err := preflight(c.exe, runDir, tempDir)
+			if err == nil {
+				t.Fatalf("preflight(%q) succeeded, want error", c.exe)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("preflight(%q) err = %q, want it to contain %q", c.exe, err, c.want)
+			}
+		})
+	}
+}
+
+func TestPreflightReportsRunDirStatErrorOtherThanNotExist(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory modes")
+	}
+	locked := filepath.Join(t.TempDir(), "locked")
+	if err := os.Mkdir(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(locked, 0o700); err != nil {
+			t.Error(err)
+		}
+	})
+
+	err := preflight("/opt/botid/bin/botid", filepath.Join(locked, "run"), "/tmp")
+	if err == nil {
+		t.Fatal("preflight succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("err = %q, want it to contain %q", err, "permission denied")
+	}
+	if strings.Contains(err.Error(), "system was not booted with systemd") {
+		t.Errorf("err = %q, must not claim that systemd is not booted", err)
+	}
+}
+
+func TestPreflightRejectsExeUnderRealOSTempDir(t *testing.T) {
+	exe := filepath.Join(os.TempDir(), "botid-test-nonexistent", "botid")
+
+	err := Preflight(exe)
+	if err == nil {
+		t.Fatalf("Preflight(%q) succeeded, want error", exe)
+	}
+	if !strings.Contains(err.Error(), "cannot create units from a temporary or go run executable") {
+		t.Errorf("err = %q", err)
+	}
+}
+
+func TestPreflightChecksExeAndSystemdWithoutWriting(t *testing.T) {
+	e := newEnv(t)
+
+	if err := preflight(e.exe, e.runDir, e.tempDir); err != nil {
+		t.Errorf("preflight with a normal path and an existing run dir: %v", err)
+	}
+
+	err := preflight(e.exe, filepath.Join(e.runDir, "missing"), e.tempDir)
+	if err == nil || !strings.Contains(err.Error(), "system was not booted with systemd") {
+		t.Errorf("preflight without the run dir: err = %v", err)
+	}
+
+	err = preflight(filepath.Join(e.tempDir, "botid"), e.runDir, e.tempDir)
+	if err == nil || !strings.Contains(err.Error(), "cannot create units from a temporary or go run executable") {
+		t.Errorf("preflight under the temp dir: err = %v", err)
+	}
+
+	err = preflight("botid", filepath.Join(e.runDir, "missing"), e.tempDir)
+	if err == nil || !strings.Contains(err.Error(), "executable path is not absolute") {
+		t.Errorf("preflight with a relative path and no run dir: err = %v, want the path error first", err)
+	}
+
 	if _, statErr := os.Stat(filepath.Join(e.home, ".config")); !errors.Is(statErr, os.ErrNotExist) {
 		t.Errorf("home was modified (stat err = %v)", statErr)
 	}
@@ -292,7 +405,7 @@ func TestInstallRewritesServiceButKeepsExistingTimer(t *testing.T) {
 	}
 
 	rec := &recorder{}
-	if err := e.install(rec.run); err != nil {
+	if err := e.install(t, rec.run); err != nil {
 		t.Fatal(err)
 	}
 
@@ -314,7 +427,7 @@ func TestInstallRewritesServiceButKeepsExistingTimer(t *testing.T) {
 	}
 
 	e.exe = filepath.Join(filepath.Dir(e.exe), "moved", "botid")
-	if err := e.install(rec.run); err != nil {
+	if err := e.install(t, rec.run); err != nil {
 		t.Fatal(err)
 	}
 	if got := readFile(t, servicePath); !strings.Contains(got, "ExecStart=\""+e.exe+"\" issue\n") {
@@ -327,11 +440,11 @@ func TestInstallRewritesServiceButKeepsExistingTimer(t *testing.T) {
 
 func TestInstallSystemctlNotFound(t *testing.T) {
 	e := newEnv(t)
-	run := func(name string, args ...string) ([]byte, error) {
+	run := func(_ context.Context, name string, args ...string) ([]byte, error) {
 		return nil, &exec.Error{Name: name, Err: exec.ErrNotFound}
 	}
 
-	err := e.install(run)
+	err := e.install(t, run)
 	if err == nil {
 		t.Fatal("install succeeded, want error")
 	}
@@ -347,7 +460,7 @@ func TestInstallDaemonReloadFailureIncludesOutput(t *testing.T) {
 		out:  map[string]string{"--user daemon-reload": "Failed to connect to bus: No medium found\n"},
 	}
 
-	err := e.install(rec.run)
+	err := e.install(t, rec.run)
 	if err == nil {
 		t.Fatal("install succeeded, want error")
 	}
@@ -366,7 +479,7 @@ func TestInstallEnableFailureShowsManualCommands(t *testing.T) {
 		out:  map[string]string{"--user enable --now botid-issue.timer": "Failed to enable unit: Access denied\n"},
 	}
 
-	err := e.install(rec.run)
+	err := e.install(t, rec.run)
 	if err == nil {
 		t.Fatal("install succeeded, want error")
 	}
@@ -401,11 +514,11 @@ func TestGeneratedUnitsPassSystemdAnalyzeVerify(t *testing.T) {
 	if err := os.WriteFile(e.exe, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.install((&recorder{}).run); err != nil {
+	if err := e.install(t, (&recorder{}).run); err != nil {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command(analyze, "--user", "verify",
+	cmd := exec.CommandContext(t.Context(), analyze, "--user", "verify",
 		filepath.Join(e.unitDir, "botid-issue.service"),
 		filepath.Join(e.unitDir, "botid-issue.timer"))
 	cmd.Env = append(os.Environ(), "HOME="+e.home, "XDG_CONFIG_HOME="+filepath.Join(e.home, ".config"))
@@ -423,7 +536,7 @@ func TestExecRunnerReturnsCombinedOutput(t *testing.T) {
 	if err != nil {
 		t.Skip("sh not found")
 	}
-	out, err := ExecRunner(sh, "-c", "echo out; echo err >&2")
+	out, err := ExecRunner(t.Context(), sh, "-c", "echo out; echo err >&2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,17 +546,17 @@ func TestExecRunnerReturnsCombinedOutput(t *testing.T) {
 }
 
 func TestExecRunnerNotFoundIsErrNotFound(t *testing.T) {
-	_, err := ExecRunner("botid-no-such-command-for-test")
+	_, err := ExecRunner(t.Context(), "botid-no-such-command-for-test")
 	if !errors.Is(err, exec.ErrNotFound) {
 		t.Errorf("err = %v, want exec.ErrNotFound", err)
 	}
 }
 
 func TestSystemctlOutputIsKeptVerbatimInError(t *testing.T) {
-	run := func(name string, args ...string) ([]byte, error) {
+	run := func(_ context.Context, name string, args ...string) ([]byte, error) {
 		return []byte("connection failed\nline2\n"), errors.New("exit status 1")
 	}
-	err := systemctl(run, "daemon-reload")
+	err := systemctl(t.Context(), run, "daemon-reload")
 	if err == nil {
 		t.Fatal("want error")
 	}

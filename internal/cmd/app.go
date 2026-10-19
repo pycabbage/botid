@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"crypto/rsa"
 	"errors"
 	"fmt"
@@ -19,20 +20,20 @@ type App struct {
 	Stdout  io.Writer
 	Stderr  io.Writer
 	Client  func(clientID string, key *rsa.PrivateKey) *ghapp.Client
-	Exec    func(env []string, name string, args ...string) ([]byte, error)
+	Exec    func(ctx context.Context, env []string, name string, args ...string) ([]byte, error)
 	Systemd systemd.Runner
 	Exe     func() (string, error)
 }
 
 // ExecCommand runs the command with env appended to os.Environ() and returns the combined stdout and stderr output.
-func ExecCommand(env []string, name string, args ...string) ([]byte, error) {
-	c := exec.Command(name, args...)
+func ExecCommand(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
+	c := exec.CommandContext(ctx, name, args...)
 	c.Env = append(os.Environ(), env...)
 	return c.CombinedOutput()
 }
 
-func (a *App) runTool(env []string, name string, args ...string) error {
-	out, err := a.Exec(env, name, args...)
+func (a *App) runTool(ctx context.Context, env []string, name string, args ...string) error {
+	out, err := a.Exec(ctx, env, name, args...)
 	if err == nil {
 		return nil
 	}

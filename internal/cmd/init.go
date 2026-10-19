@@ -23,6 +23,14 @@ func (a *App) Init(ctx context.Context) error {
 	p := paths.New(a.Home)
 	in := bufio.NewReader(a.Stdin)
 
+	exe, err := a.Exe()
+	if err != nil {
+		return fmt.Errorf("cannot get the path of the botid executable: %w", err)
+	}
+	if err := systemd.Preflight(exe); err != nil {
+		return err
+	}
+
 	proceed, err := a.confirmOverwrite(in, p.ConfigFile)
 	if err != nil {
 		return err
@@ -79,11 +87,7 @@ func (a *App) Init(ctx context.Context) error {
 		return err
 	}
 
-	exe, err := a.Exe()
-	if err != nil {
-		return fmt.Errorf("cannot get the path of the botid executable: %w", err)
-	}
-	if err := systemd.Install(a.Home, exe, a.Systemd); err != nil {
+	if err := systemd.Install(ctx, a.Home, exe, a.Systemd); err != nil {
 		return fmt.Errorf("the configuration and credentials were saved, but registering the systemd timer failed: %w", err)
 	}
 
@@ -221,13 +225,13 @@ func (a *App) setupGit(ctx context.Context, p paths.Paths, client *ghapp.Client,
 	}
 	env := []string{"GH_CONFIG_DIR=" + p.GHConfigDir, "GIT_CONFIG_GLOBAL=" + p.GitConfigFile}
 	email := fmt.Sprintf("%d+%s@users.noreply.github.com", userID, botName)
-	if err := a.runTool(env, "git", "config", "--global", "user.name", botName); err != nil {
+	if err := a.runTool(ctx, env, "git", "config", "--global", "user.name", botName); err != nil {
 		return err
 	}
-	if err := a.runTool(env, "git", "config", "--global", "user.email", email); err != nil {
+	if err := a.runTool(ctx, env, "git", "config", "--global", "user.email", email); err != nil {
 		return err
 	}
-	return a.runTool(env, "gh", "auth", "setup-git")
+	return a.runTool(ctx, env, "gh", "auth", "setup-git")
 }
 
 func readLine(in *bufio.Reader) (string, error) {

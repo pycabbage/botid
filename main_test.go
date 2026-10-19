@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -27,6 +28,7 @@ func runWith(t *testing.T, home, stdin string, args ...string) result {
 			Stdin:  strings.NewReader(stdin),
 			Stdout: &stdout,
 			Stderr: &stderr,
+			Exe:    func() (string, error) { return "/opt/botid/bin/botid", nil },
 		}, nil
 	})
 	r.stdout, r.stderr = stdout.String(), stderr.String()
@@ -128,6 +130,9 @@ func TestRuntimeErrorsAreOneLineOnStderrWithExitCode1(t *testing.T) {
 	})
 
 	t.Run("init: Client ID is empty", func(t *testing.T) {
+		if _, err := os.Stat("/run/systemd/system"); err != nil {
+			t.Skipf("init checks /run/systemd/system before it reads any input: %v", err)
+		}
 		r := runWith(t, t.TempDir(), "\n", "init")
 		if r.code != 1 {
 			t.Errorf("exit code = %d, want 1", r.code)

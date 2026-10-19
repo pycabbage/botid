@@ -1,6 +1,7 @@
 package systemd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -30,19 +31,24 @@ WantedBy=timers.target
 
 var errNoSystemctl = errors.New("systemctl not found; systemd is required")
 
-type Runner func(name string, args ...string) ([]byte, error)
+type Runner func(ctx context.Context, name string, args ...string) ([]byte, error)
 
 // ExecRunner returns the combined output of stdout and stderr.
-func ExecRunner(name string, args ...string) ([]byte, error) {
-	return exec.Command(name, args...).CombinedOutput()
+func ExecRunner(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
 }
 
-func Install(home, exe string, run Runner) error {
-	return install(home, exe, run, systemRunDir, os.TempDir())
+func Install(ctx context.Context, home, exe string, run Runner) error {
+	return install(ctx, home, exe, run, systemRunDir, os.TempDir())
+}
+
+// Preflight runs the checks that Install makes before it writes anything, so a caller can fail before it has side effects of its own.
+func Preflight(exe string) error {
+	return preflight(exe, systemRunDir, os.TempDir())
 }
 
 // runDir and tempDir are arguments that let tests replace the systemd boot check and the temporary directory check.
-func install(home, exe string, run Runner, runDir, tempDir string) error {
+func preflight(exe, runDir, tempDir string) error {
 	if err := checkExe(exe, tempDir); err != nil {
 		return err
 	}
@@ -51,7 +57,11 @@ func install(home, exe string, run Runner, runDir, tempDir string) error {
 	if errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("system was not booted with systemd (%s does not exist); no units were created", runDir)
 	}
-	if err != nil {
+	return err
+}
+
+func install(ctx context.Context, home, exe string, run Runner, runDir, tempDir string) error {
+	if err := preflight(exe, runDir, tempDir); err != nil {
 		return err
 	}
 
@@ -64,7 +74,7 @@ func install(home, exe string, run Runner, runDir, tempDir string) error {
 	}
 
 	timerPath := filepath.Join(unitDir, timerName)
-	_, err = os.Lstat(timerPath)
+	_, err := os.Lstat(timerPath)
 	if errors.Is(err, fs.ErrNotExist) {
 		err = writeFileAtomic(timerPath, []byte(timerUnit), 0o644)
 	}
@@ -72,10 +82,10 @@ func install(home, exe string, run Runner, runDir, tempDir string) error {
 		return err
 	}
 
-	if err := systemctl(run, "daemon-reload"); err != nil {
+	if err := systemctl(ctx, run, "daemon-reload"); err != nil {
 		return err
 	}
-	if err := systemctl(run, "enable", "--now", timerName); err != nil {
+	if err := systemctl(ctx, run, "enable", "--now", timerName); err != nil {
 		return fmt.Errorf("%w\nthe units have been created; to enable them manually, run:\n  systemctl --user daemon-reload\n  systemctl --user enable --now %s", err, timerName)
 	}
 	return nil
@@ -98,7 +108,7 @@ func checkExe(exe, tempDir string) error {
 	case strings.ContainsAny(exe, "\"\\$\n\r"):
 		return fmt.Errorf("executable path contains an unusable character (\", \\, $, newline): %q", exe)
 	case strings.Contains(exe, "go-build") || underDir(tempDir, exe):
-		return fmt.Errorf("cannot create units from an executable in a temporary directory (a go run binary); run a binary built with go build: %q", exe)
+		return fmt.Errorf("cannot create units from a temporary or go run executable (%q); build the binary with go build and run it from where it will stay", exe)
 	}
 	return nil
 }
@@ -108,9 +118,9 @@ func underDir(dir, path string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-func systemctl(run Runner, args ...string) error {
+func systemctl(ctx context.Context, run Runner, args ...string) error {
 	full := append([]string{"--user"}, args...)
-	out, err := run("systemctl", full...)
+	out, err := run(ctx, "systemctl", full...)
 	if err == nil {
 		return nil
 	}

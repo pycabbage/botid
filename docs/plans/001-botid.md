@@ -139,9 +139,10 @@ func HostsYAML(slug, token string) ([]byte, error)           // rejection condit
 func DotEnv(ghConfigDir, gitConfigGlobal string) (string, error)  // error if a path is not absolute or contains ' or a newline
 
 // internal/systemd
-type Runner func(name string, args ...string) ([]byte, error)
-func ExecRunner(name string, args ...string) ([]byte, error)     // runs with os/exec and returns the combined stdout and stderr output
-func Install(home, exe string, run Runner) error                 // only calls install(home, exe, run, "/run/systemd/system", os.TempDir())
+type Runner func(ctx context.Context, name string, args ...string) ([]byte, error)
+func ExecRunner(ctx context.Context, name string, args ...string) ([]byte, error) // runs with exec.CommandContext and returns the combined stdout and stderr output
+func Install(ctx context.Context, home, exe string, run Runner) error // only calls install(ctx, home, exe, run, "/run/systemd/system", os.TempDir())
+func Preflight(exe string) error // the checks Install makes before it writes anything; Init calls it first
 
 // internal/cmd
 type App struct {
@@ -150,11 +151,11 @@ type App struct {
     Stdout  io.Writer
     Stderr  io.Writer
     Client  func(clientID string, key *rsa.PrivateKey) *ghapp.Client // creates a ghapp.Client. Tests replace BaseURL
-    Exec    func(env []string, name string, args ...string) ([]byte, error) // git and gh that init runs
+    Exec    func(ctx context.Context, env []string, name string, args ...string) ([]byte, error) // git and gh that init runs
     Systemd systemd.Runner                                           // systemctl calls
     Exe     func() (string, error)                                   // os.Executable in production
 }
-func ExecCommand(env []string, name string, args ...string) ([]byte, error) // runs with env added to os.Environ(). Returns the combined output
+func ExecCommand(ctx context.Context, env []string, name string, args ...string) ([]byte, error) // runs with exec.CommandContext and env added to os.Environ(). Returns the combined output
 func (a *App) Init(ctx context.Context) error
 func (a *App) Issue(ctx context.Context) error
 func (a *App) Env() error
@@ -218,6 +219,7 @@ GIT_CONFIG_GLOBAL='/home/<user>/.local/share/botid/git/config'
 
 Read from standard input. One `bufio.Reader` is shared to the end, so that no buffered input is lost between prompts.
 
+0. Before anything else, get the path of the executable (`App.Exe`) and call `systemd.Preflight` with it. `Preflight` validates the executable path (§8) and that systemd was booted (`/run/systemd/system` exists), which are the checks `systemd.Install` makes before it writes anything. If either fails, end with that error unchanged, before the overwrite confirmation, before any prompt, before any network call, and before any disk write. If `App.Exe` itself fails, end with `cannot get the path of the botid executable` at this point. The same `exe` value is passed to `systemd.Install` at step 8.
 1. If `config.json` exists, print a warning to standard error and ask `Overwrite? [y/n]: ` on standard output. Continue only if the input, with surrounding whitespace removed, is exactly `y`. Anything other than `y` (including `Y`, `yes`, and EOF) changes nothing, prints `Exited without changing anything.` to standard output, and ends with exit code 0.
 2. Read `Client ID: `. If it is empty (including EOF), end with an error (exit code 1).
 3. Read `Private Key (PEM contents or file path): `.
@@ -242,7 +244,7 @@ Read from standard input. One `bufio.Reader` is shared to the end, so that no bu
    2. `git config --global user.name '<slug>[bot]'`
    3. `git config --global user.email '<id>+<slug>[bot]@users.noreply.github.com'`
    4. `gh auth setup-git` (`--force` is not needed, because hosts.yml was written first)
-8. Create and enable the systemd units (§8). If `os.Executable()` cannot be obtained, it is an error.
+8. Create and enable the systemd units (§8) with the `exe` obtained at step 0.
 9. Show what was done and tell the user to run `botid env`.
 
 Handling of failures:
@@ -358,7 +360,7 @@ The path in `ExecStart`:
 - If the path is under `os.TempDir()` or contains `go-build`, treat it as a temporary binary from `go run` and abort. It was confirmed on the real machine that the temporary directory of `go run` disappears after the run. The `os.TempDir()` check is made at the directory boundary (`/tmp-other/botid` is not treated as under `/tmp`).
 - If the path contains `"`, `\`, `$`, or a newline (`\n`, `\r`), abort. The escaping rules for writing these out are unconfirmed, so they are not accepted.
 - The path is enclosed in double quotes, and `%` is escaped as `%%` (it was confirmed on the real machine that quoting and escaping a path that contains `%` passes `verify`).
-- The checks above run before the unit directory is created. If aborted, nothing is written and `systemctl` is not called.
+- The checks above run at the start of `init` (`systemd.Preflight`, §6.3 step 0) and again in `systemd.Install`, before the unit directory is created. `Install` and `Preflight` share one internal function, so the two cannot drift. If aborted, nothing is written and `systemctl` is not called.
 
 Idempotency:
 
@@ -445,7 +447,6 @@ Verifying `botid init` with the credentials of a real GitHub App can be done onl
 - That `GET /app` returns `slug` (only the schema in the official documentation, and the measurement that it returns 401 without authentication. The success case with a JWT is unverified)
 - The success cases of `gh api`, `gh pr create`, `gh repo clone`, and HTTPS `git clone` and `git push` with a `ghs_` token (with a dummy token, only up to 401 can be confirmed)
 - The possibility that a gh command that queries `viewer` fails with an installation token (this comes from reading the gh source and has not been measured)
-- `noctx` (golangci-lint) is not enabled. It reports `exec.Command` without a context in `internal/systemd/systemd.go`, `internal/cmd/app.go` and in tests (`internal/integration/integration_test.go`). Enabling it needs a context in the `systemd.Runner` and `App.Exec` function types; this is a design decision that has not been made.
 
 ## 12. Items to settle by measurement during implementation
 

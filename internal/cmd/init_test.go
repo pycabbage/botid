@@ -3,6 +3,7 @@ package cmd_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,7 +21,7 @@ var (
 func requireSystemd(t *testing.T) {
 	t.Helper()
 	if _, err := os.Stat("/run/systemd/system"); err != nil {
-		t.Skipf("systemd.Install requires /run/systemd/system: %v", err)
+		t.Skipf("init checks /run/systemd/system before it reads any input: %v", err)
 	}
 }
 
@@ -52,6 +53,108 @@ func (h *harness) assertExistingConfigIntact() {
 	}
 	if got := h.gh.requests(); len(got) != 0 {
 		h.t.Errorf("requests were sent to GitHub: %v", got)
+	}
+}
+
+// assertInitRejectedBeforeAnySideEffect checks that Init failed with an error containing want
+// without reading stdin, printing, calling GitHub, running any external command, or building a client.
+func (h *harness) assertInitRejectedBeforeAnySideEffect(err error, want string, stdin *strings.Reader, stdinLen int) {
+	h.t.Helper()
+	if err == nil || !strings.Contains(err.Error(), want) {
+		h.t.Errorf("error = %v, want substring %q", err, want)
+	}
+	if err != nil && strings.Contains(err.Error(), "saved") {
+		h.t.Errorf("error mentions saved data although nothing was saved: %q", err)
+	}
+	if got := h.gh.requests(); len(got) != 0 {
+		h.t.Errorf("requests were sent to GitHub: %v", got)
+	}
+	if got := h.rec.lines(); len(got) != 0 {
+		h.t.Errorf("external commands were run (Exec or Systemd): %v", got)
+	}
+	if len(h.clientIDs) != 0 {
+		h.t.Errorf("a GitHub client was created: %v", h.clientIDs)
+	}
+	if got := h.stdout.String(); got != "" {
+		h.t.Errorf("stdout = %q, want it empty", got)
+	}
+	if got := h.stderr.String(); got != "" {
+		h.t.Errorf("stderr = %q, want it empty", got)
+	}
+	if stdin.Len() != stdinLen {
+		h.t.Errorf("stdin was consumed: %d of %d bytes remain", stdin.Len(), stdinLen)
+	}
+}
+
+func TestInitRejectsGoRunBinaryBeforeAnySideEffect(t *testing.T) {
+	input := testClientID + "\n" + pkcs1PEM(t)
+
+	t.Run("fresh home", func(t *testing.T) {
+		h := newHarness(t, "", alice)
+		h.app.Exe = func() (string, error) { return "/home/x/.cache/go-build/ab/cd-d/botid", nil }
+		stdin := strings.NewReader(input)
+		h.app.Stdin = stdin
+
+		err := h.app.Init(context.Background())
+
+		h.assertInitRejectedBeforeAnySideEffect(err, "cannot create units from a temporary or go run executable", stdin, len(input))
+		h.assertHomeUntouched()
+		for _, rel := range []string{".config/botid", ".local/share/botid", ".config/systemd"} {
+			if _, statErr := os.Stat(h.path(rel)); !errors.Is(statErr, os.ErrNotExist) {
+				t.Errorf("%s exists (stat err = %v)", rel, statErr)
+			}
+		}
+		if strings.Contains(h.stdout.String(), "Client ID: ") || strings.Contains(h.stdout.String(), "Overwrite?") {
+			t.Errorf("a prompt was printed: %q", h.stdout.String())
+		}
+	})
+
+	t.Run("existing config.json is not asked about and stays byte-identical", func(t *testing.T) {
+		h := newHarness(t, "", alice)
+		h.writeExistingConfig()
+		h.app.Exe = func() (string, error) { return "/home/x/.cache/go-build/ab/cd-d/botid", nil }
+		stdin := strings.NewReader("y\n" + input)
+		h.app.Stdin = stdin
+
+		err := h.app.Init(context.Background())
+
+		h.assertInitRejectedBeforeAnySideEffect(err, "cannot create units from a temporary or go run executable", stdin, len("y\n"+input))
+		h.assertExistingConfigIntact()
+		if strings.Contains(h.stdout.String(), "Overwrite?") {
+			t.Errorf("the overwrite prompt was printed: %q", h.stdout.String())
+		}
+	})
+}
+
+func TestInitRejectsUnusableExecutableBeforeAnySideEffect(t *testing.T) {
+	tests := []struct {
+		name string
+		exe  string
+		want string
+	}{
+		{"under os.TempDir()", filepath.Join(os.TempDir(), "botid-test-nonexistent", "botid"), "cannot create units from a temporary or go run executable"},
+		{"relative path", "botid", `executable path is not absolute: "botid"`},
+		{"relative path (./)", "./botid", `executable path is not absolute: "./botid"`},
+		{"empty", "", `executable path is not absolute: ""`},
+		{"double quote", "/opt/bo\"tid/botid", "executable path contains an unusable character"},
+		{"backslash", "/opt/bo\\tid/botid", "executable path contains an unusable character"},
+		{"dollar sign", "/opt/bo$tid/botid", "executable path contains an unusable character"},
+		{"newline", "/opt/bo\ntid/botid", "executable path contains an unusable character"},
+		{"carriage return", "/opt/bo\rtid/botid", "executable path contains an unusable character"},
+	}
+	input := testClientID + "\n" + pkcs1PEM(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, "", alice)
+			h.app.Exe = func() (string, error) { return tt.exe, nil }
+			stdin := strings.NewReader(input)
+			h.app.Stdin = stdin
+
+			err := h.app.Init(context.Background())
+
+			h.assertInitRejectedBeforeAnySideEffect(err, tt.want, stdin, len(input))
+			h.assertHomeUntouched()
+		})
 	}
 }
 
@@ -202,6 +305,7 @@ func TestInitInstallationSelection(t *testing.T) {
 }
 
 func TestInitInvalidSelectionWritesNothing(t *testing.T) {
+	requireSystemd(t)
 	pem := pkcs1PEM(t)
 	tests := []struct {
 		name  string
@@ -235,6 +339,7 @@ func TestInitInvalidSelectionWritesNothing(t *testing.T) {
 }
 
 func TestInitWithNoInstallationsWritesNothing(t *testing.T) {
+	requireSystemd(t)
 	h := newHarness(t, testClientID+"\n"+pkcs1PEM(t))
 
 	err := h.app.Init(context.Background())
@@ -245,6 +350,7 @@ func TestInitWithNoInstallationsWritesNothing(t *testing.T) {
 }
 
 func TestInitWithWrongCredentialsWritesNothing(t *testing.T) {
+	requireSystemd(t)
 	tests := []struct {
 		name    string
 		failing string
@@ -272,6 +378,7 @@ func TestInitWithWrongCredentialsWritesNothing(t *testing.T) {
 }
 
 func TestInitRejectsBadPrivateKeyInputWritesNothing(t *testing.T) {
+	requireSystemd(t)
 	encrypted := "-----BEGIN RSA PRIVATE KEY-----\n" +
 		"Proc-Type: 4,ENCRYPTED\n" +
 		"DEK-Info: AES-128-CBC,00112233445566778899AABBCCDDEEFF\n" +
@@ -378,6 +485,33 @@ func TestInitRunsGitAndGhIsolatedThenSystemdLast(t *testing.T) {
 	}
 	if got := h.gh.requests(); !equalLines(got, wantReqs) {
 		t.Errorf("GitHub requests = %v, want %v", got, wantReqs)
+	}
+}
+
+type ctxKey struct{}
+
+func TestInitPassesItsContextToExternalCommands(t *testing.T) {
+	requireSystemd(t)
+	h := newHarness(t, testClientID+"\n"+pkcs1PEM(t), alice)
+	ctx := context.WithValue(t.Context(), ctxKey{}, "init-ctx")
+
+	if err := h.app.Init(ctx); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	want := []string{
+		"git config --global user.name my-app[bot] => init-ctx",
+		"git config --global user.email 123456+my-app[bot]@users.noreply.github.com => init-ctx",
+		"gh auth setup-git => init-ctx",
+		"systemctl --user daemon-reload => init-ctx",
+		"systemctl --user enable --now botid-issue.timer => init-ctx",
+	}
+	var got []string
+	for _, c := range h.rec.calls {
+		got = append(got, fmt.Sprintf("%s => %v", c.line(), c.Ctx))
+	}
+	if !equalLines(got, want) {
+		t.Errorf("context value seen by each external command =\n%v\nwant\n%v", got, want)
 	}
 }
 
@@ -563,9 +697,17 @@ func TestInitFailsWhenExecutablePathIsUnavailable(t *testing.T) {
 			t.Errorf("systemctl was run: %v", h.rec.lines())
 		}
 	}
+	h.assertHomeUntouched()
+	if got := h.gh.requests(); len(got) != 0 {
+		t.Errorf("requests were sent to GitHub: %v", got)
+	}
+	if got := h.stdout.String(); got != "" {
+		t.Errorf("stdout = %q, want it empty", got)
+	}
 }
 
 func TestInitStopsOnBotUserIDFailureBeforeRunningGit(t *testing.T) {
+	requireSystemd(t)
 	h := newHarness(t, testClientID+"\n"+pkcs1PEM(t), alice)
 	h.gh.fail["GET /users/my-app%5Bbot%5D"] = 401
 
