@@ -8,35 +8,55 @@ import (
 func TestNew(t *testing.T) {
 	got := New("/home/alice")
 	want := Paths{
-		ConfigDir:      "/home/alice/.config/botid",
-		ConfigFile:     "/home/alice/.config/botid/config.json",
-		PrivateKeyFile: "/home/alice/.config/botid/private-key.pem",
-		DataDir:        "/home/alice/.local/share/botid",
-		GHConfigDir:    "/home/alice/.local/share/botid/gh",
-		HostsFile:      "/home/alice/.local/share/botid/gh/hosts.yml",
-		GitConfigDir:   "/home/alice/.local/share/botid/git",
-		GitConfigFile:  "/home/alice/.local/share/botid/git/config",
+		ConfigDir:  "/home/alice/.config/botid",
+		ConfigFile: "/home/alice/.config/botid/config.json",
+		DataDir:    "/home/alice/.local/share/botid",
 	}
 	if got != want {
 		t.Errorf("New(\"/home/alice\") = %+v, want %+v", got, want)
 	}
 }
 
-func TestNewSeparatesConfigAndGeneratedFiles(t *testing.T) {
+func TestIdentity(t *testing.T) {
+	got := New("/home/alice").Identity("my-app")
+	want := Identity{
+		ConfigDir:      "/home/alice/.config/botid/identities/my-app",
+		PrivateKeyFile: "/home/alice/.config/botid/identities/my-app/private-key.pem",
+		DataDir:        "/home/alice/.local/share/botid/identities/my-app",
+		GHConfigDir:    "/home/alice/.local/share/botid/identities/my-app/gh",
+		HostsFile:      "/home/alice/.local/share/botid/identities/my-app/gh/hosts.yml",
+		GitConfigDir:   "/home/alice/.local/share/botid/identities/my-app/git",
+		GitConfigFile:  "/home/alice/.local/share/botid/identities/my-app/git/config",
+	}
+	if got != want {
+		t.Errorf("Identity(\"my-app\") = %+v, want %+v", got, want)
+	}
+}
+
+func TestIdentitiesDoNotShareFiles(t *testing.T) {
 	p := New("/home/alice")
+	a, b := p.Identity("bot-a"), p.Identity("bot-b")
+	if a.PrivateKeyFile == b.PrivateKeyFile || a.HostsFile == b.HostsFile || a.GitConfigFile == b.GitConfigFile {
+		t.Errorf("identities share a file: %+v, %+v", a, b)
+	}
+}
+
+func TestIdentitySeparatesConfigAndGeneratedFiles(t *testing.T) {
+	id := New("/home/alice").Identity("my-app")
 	for name, path := range map[string]string{
-		"ConfigFile":     p.ConfigFile,
-		"PrivateKeyFile": p.PrivateKeyFile,
+		"ConfigDir":      id.ConfigDir,
+		"PrivateKeyFile": id.PrivateKeyFile,
 	} {
 		if !strings.HasPrefix(path, "/home/alice/.config/botid/") {
 			t.Errorf("%s = %q, want under /home/alice/.config/botid/", name, path)
 		}
 	}
 	for name, path := range map[string]string{
-		"HostsFile":     p.HostsFile,
-		"GitConfigFile": p.GitConfigFile,
-		"GHConfigDir":   p.GHConfigDir,
-		"GitConfigDir":  p.GitConfigDir,
+		"DataDir":       id.DataDir,
+		"HostsFile":     id.HostsFile,
+		"GitConfigFile": id.GitConfigFile,
+		"GHConfigDir":   id.GHConfigDir,
+		"GitConfigDir":  id.GitConfigDir,
 	} {
 		if !strings.HasPrefix(path, "/home/alice/.local/share/botid/") {
 			t.Errorf("%s = %q, want under /home/alice/.local/share/botid/", name, path)
@@ -51,14 +71,9 @@ func TestNewIgnoresXDGEnvironment(t *testing.T) {
 
 	got := New("/home/alice")
 	want := Paths{
-		ConfigDir:      "/home/alice/.config/botid",
-		ConfigFile:     "/home/alice/.config/botid/config.json",
-		PrivateKeyFile: "/home/alice/.config/botid/private-key.pem",
-		DataDir:        "/home/alice/.local/share/botid",
-		GHConfigDir:    "/home/alice/.local/share/botid/gh",
-		HostsFile:      "/home/alice/.local/share/botid/gh/hosts.yml",
-		GitConfigDir:   "/home/alice/.local/share/botid/git",
-		GitConfigFile:  "/home/alice/.local/share/botid/git/config",
+		ConfigDir:  "/home/alice/.config/botid",
+		ConfigFile: "/home/alice/.config/botid/config.json",
+		DataDir:    "/home/alice/.local/share/botid",
 	}
 	if got != want {
 		t.Errorf("New(\"/home/alice\") = %+v, want %+v", got, want)

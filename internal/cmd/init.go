@@ -31,13 +31,18 @@ func (a *App) Init(ctx context.Context) error {
 		return err
 	}
 
-	proceed, err := a.confirmOverwrite(in, p.ConfigFile)
-	if err != nil {
+	c, err := config.Load(p.ConfigFile)
+	fresh := false
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		fresh = true
+	case errors.Is(err, config.ErrLegacy):
+		c, err = a.migrate(ctx, p)
+		if err != nil {
+			return err
+		}
+	case err != nil:
 		return err
-	}
-	if !proceed {
-		_, _ = fmt.Fprintln(a.Stdout, "Exited without changing anything.")
-		return nil
 	}
 
 	_, _ = fmt.Fprint(a.Stdout, "Client ID: ")
@@ -74,49 +79,77 @@ func (a *App) Init(ctx context.Context) error {
 		return fmt.Errorf("cannot generate hosts.yml: %w", err)
 	}
 
-	if err := writeCredentials(p, config.Config{
-		ClientID:       clientID,
-		PrivateKeyPath: p.PrivateKeyFile,
-		InstallationID: installation.ID,
-	}, pemBytes, hosts); err != nil {
-		return err
+	name := cred.Slug
+	if err := config.ValidName(name); err != nil {
+		return fmt.Errorf("cannot use the App slug as an identity name: %w", err)
+	}
+	if _, exists := c.Identities[name]; exists {
+		proceed, err := a.confirmOverwrite(in, fmt.Sprintf("Warning: identity %q already exists in %s. If you continue, its credentials and private key will be overwritten.\n", name, p.ConfigFile))
+		if err != nil {
+			return err
+		}
+		if !proceed {
+			a.printExited()
+			return nil
+		}
 	}
 
-	botName := cred.Slug + "[bot]"
-	if err := a.setupGit(ctx, p, client, cred, botName); err != nil {
+	id := p.Identity(name)
+	if err := writeIdentity(p, id, pemBytes, hosts); err != nil {
 		return err
+	}
+	botName := name + "[bot]"
+	if err := a.setupGit(ctx, id, client, cred, botName); err != nil {
+		return err
+	}
+	isDefault := fresh || c.Default == name
+	if fresh {
+		c = config.Config{Default: name}
+	}
+	if c.Identities == nil {
+		c.Identities = map[string]config.Identity{}
+	}
+	c.Identities[name] = config.Identity{
+		ClientID:       clientID,
+		PrivateKeyPath: id.PrivateKeyFile,
+		InstallationID: installation.ID,
+	}
+	if err := config.Save(p.ConfigFile, c); err != nil {
+		return fmt.Errorf("cannot write %s: %w", p.ConfigFile, err)
 	}
 
 	if err := systemd.Install(ctx, a.Home, exe, a.Systemd); err != nil {
 		return fmt.Errorf("the configuration and credentials were saved, but registering the systemd timer failed: %w", err)
 	}
 
+	role := "not the default"
+	if isDefault {
+		role = "default"
+	}
 	_, _ = fmt.Fprintf(a.Stdout, `
 botid init is complete.
+  Identity:     %s (%s)
   Config:       %s
-                %s
+  Private key:  %s
   Credentials:  %s (%s)
   git config:   %s (user.name, user.email, credential helper)
   systemd:      enabled botid-issue.timer (runs botid issue every 45 minutes)
 
 Next steps:
-  Run botid env and set the printed environment variables once in the coding agent's environment.
+  To use an identity for specific repositories or branches, add rules to "rules" in %s.
 
 Note:
   To keep the timer running while you are logged out, run loginctl enable-linger. botid does not change this setting.
-`, p.ConfigFile, p.PrivateKeyFile, p.HostsFile, botName, p.GitConfigFile)
+`, name, role, p.ConfigFile, id.PrivateKeyFile, id.HostsFile, botName, id.GitConfigFile, p.ConfigFile)
 	return nil
 }
 
-func (a *App) confirmOverwrite(in *bufio.Reader, configFile string) (bool, error) {
-	_, err := os.Stat(configFile)
-	if errors.Is(err, fs.ErrNotExist) {
-		return true, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("cannot check %s: %w", configFile, err)
-	}
-	_, _ = fmt.Fprintf(a.Stderr, "Warning: %s already exists. If you continue, the configuration and private key will be overwritten.\n", configFile)
+func (a *App) printExited() {
+	_, _ = fmt.Fprintln(a.Stdout, "Exited without changing anything.")
+}
+
+func (a *App) confirmOverwrite(in *bufio.Reader, warning string) (bool, error) {
+	_, _ = fmt.Fprint(a.Stderr, warning)
 	_, _ = fmt.Fprint(a.Stdout, "Overwrite? [y/n]: ")
 	answer, err := readLine(in)
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -193,37 +226,32 @@ func (a *App) chooseInstallation(ctx context.Context, in *bufio.Reader, client *
 	return installations[n-1], nil
 }
 
-func writeCredentials(p paths.Paths, c config.Config, pemBytes, hosts []byte) error {
-	if err := store.EnsureDir(p.ConfigDir); err != nil {
-		return fmt.Errorf("cannot create %s: %w", p.ConfigDir, err)
+// writeIdentity writes the private key and hosts.yml of one identity. config.json is written later, once the whole setup has worked.
+func writeIdentity(p paths.Paths, id paths.Identity, pemBytes, hosts []byte) error {
+	if err := ensureDirs(p.ConfigDir, filepath.Dir(id.ConfigDir), id.ConfigDir); err != nil {
+		return err
 	}
-	if err := store.WriteFileAtomic(p.PrivateKeyFile, pemBytes, 0o600); err != nil {
-		return fmt.Errorf("cannot write %s: %w", p.PrivateKeyFile, err)
+	if err := store.WriteFileAtomic(id.PrivateKeyFile, pemBytes, 0o600); err != nil {
+		return fmt.Errorf("cannot write %s: %w", id.PrivateKeyFile, err)
 	}
-	if err := config.Save(p.ConfigFile, c); err != nil {
-		return fmt.Errorf("cannot write %s: %w", p.ConfigFile, err)
+	if err := ensureDirs(p.DataDir, filepath.Dir(id.DataDir), id.DataDir, id.GHConfigDir); err != nil {
+		return err
 	}
-	if err := store.EnsureDir(p.DataDir); err != nil {
-		return fmt.Errorf("cannot create %s: %w", p.DataDir, err)
-	}
-	if err := store.EnsureDir(p.GHConfigDir); err != nil {
-		return fmt.Errorf("cannot create %s: %w", p.GHConfigDir, err)
-	}
-	if err := store.WriteFileAtomic(p.HostsFile, hosts, 0o600); err != nil {
-		return fmt.Errorf("cannot write %s: %w", p.HostsFile, err)
+	if err := store.WriteFileAtomic(id.HostsFile, hosts, 0o600); err != nil {
+		return fmt.Errorf("cannot write %s: %w", id.HostsFile, err)
 	}
 	return nil
 }
 
-func (a *App) setupGit(ctx context.Context, p paths.Paths, client *ghapp.Client, cred ghapp.Credential, botName string) error {
-	if err := store.EnsureDir(p.GitConfigDir); err != nil {
-		return fmt.Errorf("cannot create %s: %w", p.GitConfigDir, err)
+func (a *App) setupGit(ctx context.Context, id paths.Identity, client *ghapp.Client, cred ghapp.Credential, botName string) error {
+	if err := ensureDirs(id.GitConfigDir); err != nil {
+		return err
 	}
 	userID, err := client.BotUserID(ctx, cred.Token, cred.Slug)
 	if err != nil {
 		return err
 	}
-	env := []string{"GH_CONFIG_DIR=" + p.GHConfigDir, "GIT_CONFIG_GLOBAL=" + p.GitConfigFile}
+	env := []string{"GH_CONFIG_DIR=" + id.GHConfigDir, "GIT_CONFIG_GLOBAL=" + id.GitConfigFile}
 	email := fmt.Sprintf("%d+%s@users.noreply.github.com", userID, botName)
 	if err := a.runTool(ctx, env, "git", "config", "--global", "user.name", botName); err != nil {
 		return err

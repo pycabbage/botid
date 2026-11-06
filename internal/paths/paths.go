@@ -7,8 +7,14 @@ import (
 )
 
 type Paths struct {
+	ConfigDir  string
+	ConfigFile string
+	DataDir    string
+}
+
+// Identity holds the paths of one App identity.
+type Identity struct {
 	ConfigDir      string
-	ConfigFile     string
 	PrivateKeyFile string
 	DataDir        string
 	GHConfigDir    string
@@ -19,12 +25,21 @@ type Paths struct {
 
 func New(home string) Paths {
 	configDir := filepath.Join(home, ".config", "botid")
-	dataDir := filepath.Join(home, ".local", "share", "botid")
+	return Paths{
+		ConfigDir:  configDir,
+		ConfigFile: filepath.Join(configDir, "config.json"),
+		DataDir:    filepath.Join(home, ".local", "share", "botid"),
+	}
+}
+
+// Identity returns the paths of the identity with the given name. The name has passed config.ValidName.
+func (p Paths) Identity(name string) Identity {
+	configDir := filepath.Join(p.ConfigDir, "identities", name)
+	dataDir := filepath.Join(p.DataDir, "identities", name)
 	ghConfigDir := filepath.Join(dataDir, "gh")
 	gitConfigDir := filepath.Join(dataDir, "git")
-	return Paths{
+	return Identity{
 		ConfigDir:      configDir,
-		ConfigFile:     filepath.Join(configDir, "config.json"),
 		PrivateKeyFile: filepath.Join(configDir, "private-key.pem"),
 		DataDir:        dataDir,
 		GHConfigDir:    ghConfigDir,

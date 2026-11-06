@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/pycabbage/botid/internal/cmd"
+	"github.com/pycabbage/botid/internal/config"
 	"github.com/pycabbage/botid/internal/ghapp"
 )
 
@@ -55,11 +56,24 @@ func pkcs8PEM(t *testing.T) string {
 	return string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
 }
 
+const testSlug = "my-app"
+
 type githubFake struct {
 	mu       sync.Mutex
 	reqs     []string
 	installs []ghapp.Installation
 	fail     map[string]int
+	slug     string
+	tokens   map[int64]string
+}
+
+func (g *githubFake) tokenFor(id int64) string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if token, ok := g.tokens[id]; ok {
+		return token
+	}
+	return testToken
 }
 
 func (g *githubFake) requests() []string {
@@ -79,6 +93,7 @@ func (g *githubFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.mu.Lock()
 	g.reqs = append(g.reqs, line)
 	status := g.fail[line]
+	slug := g.slug
 	g.mu.Unlock()
 
 	if status != 0 {
@@ -94,8 +109,8 @@ func (g *githubFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, 200, "["+strings.Join(items, ",")+"]")
 	case "GET /app":
-		writeJSON(w, 200, `{"slug":"my-app"}`)
-	case "GET /users/my-app%5Bbot%5D":
+		writeJSON(w, 200, `{"slug":"`+slug+`"}`)
+	case "GET /users/" + slug + "%5Bbot%5D":
 		if auth != "Bearer "+testToken {
 			writeJSON(w, 401, `{"message":"Bad credentials"}`)
 			return
@@ -104,7 +119,7 @@ func (g *githubFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		for _, it := range g.installs {
 			if line == fmt.Sprintf("POST /app/installations/%d/access_tokens", it.ID) {
-				writeJSON(w, 201, `{"token":"`+testToken+`","expires_at":"2026-10-19T12:00:00Z"}`)
+				writeJSON(w, 201, `{"token":"`+g.tokenFor(it.ID)+`","expires_at":"2026-10-19T12:00:00Z"}`)
 				return
 			}
 		}
@@ -179,7 +194,7 @@ func newHarness(t *testing.T, stdin string, installs ...ghapp.Installation) *har
 		home:   t.TempDir(),
 		stdout: &bytes.Buffer{},
 		stderr: &bytes.Buffer{},
-		gh:     &githubFake{installs: installs, fail: map[string]int{}},
+		gh:     &githubFake{installs: installs, fail: map[string]int{}, slug: testSlug, tokens: map[int64]string{}},
 		rec:    &recorder{errs: map[string]error{}, out: map[string]string{}},
 	}
 	srv := httptest.NewServer(h.gh)
@@ -215,6 +230,17 @@ func (h *harness) write(rel, content string) {
 		h.t.Fatal(err)
 	}
 	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *harness) saveConfig(c config.Config) {
+	h.t.Helper()
+	dir := h.path(".config", "botid")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		h.t.Fatal(err)
+	}
+	if err := config.Save(filepath.Join(dir, "config.json"), c); err != nil {
 		h.t.Fatal(err)
 	}
 }

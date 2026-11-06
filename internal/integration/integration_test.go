@@ -22,13 +22,17 @@ const (
 
 type sandbox struct {
 	home string
-	p    paths.Paths
+	id   paths.Identity
 }
 
 func newSandbox(t *testing.T) sandbox {
 	t.Helper()
-	home := t.TempDir()
-	return sandbox{home: home, p: paths.New(home)}
+	return newSandboxFor(t.TempDir(), botSlug)
+}
+
+// newSandboxFor returns a sandbox that uses the store of the identity name below home.
+func newSandboxFor(home, name string) sandbox {
+	return sandbox{home: home, id: paths.New(home).Identity(name)}
 }
 
 // The child process environment does not inherit os.Environ(); everything except PATH is built here.
@@ -42,8 +46,8 @@ func (s sandbox) env() []string {
 		"XDG_DATA_HOME=" + filepath.Join(s.home, ".local", "share"),
 		"XDG_CACHE_HOME=" + filepath.Join(s.home, ".cache"),
 		"XDG_STATE_HOME=" + filepath.Join(s.home, ".local", "state"),
-		"GH_CONFIG_DIR=" + s.p.GHConfigDir,
-		"GIT_CONFIG_GLOBAL=" + s.p.GitConfigFile,
+		"GH_CONFIG_DIR=" + s.id.GHConfigDir,
+		"GIT_CONFIG_GLOBAL=" + s.id.GitConfigFile,
 		"GIT_CONFIG_SYSTEM=/dev/null",
 		"GIT_TERMINAL_PROMPT=0",
 		"GH_PROMPT_DISABLED=1",
@@ -81,35 +85,45 @@ func (s sandbox) mustRun(t *testing.T, stdin string, name string, args ...string
 
 func (s sandbox) writeHosts(t *testing.T) {
 	t.Helper()
-	if err := store.EnsureDir(s.p.DataDir); err != nil {
+	s.writeHostsFor(t, botSlug, botToken)
+}
+
+func (s sandbox) writeHostsFor(t *testing.T, slug, token string) {
+	t.Helper()
+	if err := store.EnsureDir(s.id.DataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EnsureDir(s.p.GHConfigDir); err != nil {
+	if err := store.EnsureDir(s.id.GHConfigDir); err != nil {
 		t.Fatal(err)
 	}
-	data, err := store.HostsYAML(botSlug, botToken)
+	data, err := store.HostsYAML(slug, token)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.WriteFileAtomic(s.p.HostsFile, data, 0o600); err != nil {
+	if err := store.WriteFileAtomic(s.id.HostsFile, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func (s sandbox) ensureGitConfigDir(t *testing.T) {
 	t.Helper()
-	if err := store.EnsureDir(s.p.DataDir); err != nil {
+	if err := store.EnsureDir(s.id.DataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EnsureDir(s.p.GitConfigDir); err != nil {
+	if err := store.EnsureDir(s.id.GitConfigDir); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func (s sandbox) setBotIdentity(t *testing.T) {
 	t.Helper()
-	s.mustRun(t, "", "git", "config", "--global", "user.name", "example-app[bot]")
-	s.mustRun(t, "", "git", "config", "--global", "user.email", "123+example-app[bot]@users.noreply.github.com")
+	s.setGitUser(t, "example-app[bot]", "123+example-app[bot]@users.noreply.github.com")
+}
+
+func (s sandbox) setGitUser(t *testing.T, name, email string) {
+	t.Helper()
+	s.mustRun(t, "", "git", "config", "--global", "user.name", name)
+	s.mustRun(t, "", "git", "config", "--global", "user.email", email)
 }
 
 func requireTools(t *testing.T, names ...string) {
@@ -151,7 +165,9 @@ func (a statSnapshot) equal(b statSnapshot) bool {
 	return a.exists == b.exists && a.modTime.Equal(b.modTime)
 }
 
-func TestIntegration(t *testing.T) {
+// guardRealHome fails the test if it creates or modifies the gh or git configuration of the user who runs the tests.
+func guardRealHome(t *testing.T) {
+	t.Helper()
 	realHome, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatal(err)
@@ -172,6 +188,10 @@ func TestIntegration(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestIntegration(t *testing.T) {
+	guardRealHome(t)
 
 	t.Run("gh auth token", func(t *testing.T) {
 		requireTools(t, "gh")
@@ -194,7 +214,7 @@ func TestIntegration(t *testing.T) {
 
 		var section []string
 		inSection := false
-		for _, line := range strings.Split(readFile(t, s.p.GitConfigFile), "\n") {
+		for _, line := range strings.Split(readFile(t, s.id.GitConfigFile), "\n") {
 			trimmed := strings.TrimSpace(line)
 			switch {
 			case trimmed == `[credential "https://github.com"]`:
@@ -206,7 +226,7 @@ func TestIntegration(t *testing.T) {
 			}
 		}
 		if len(section) == 0 {
-			t.Fatalf("[credential \"https://github.com\"] not found:\n%s", readFile(t, s.p.GitConfigFile))
+			t.Fatalf("[credential \"https://github.com\"] not found:\n%s", readFile(t, s.id.GitConfigFile))
 		}
 		hasReset := false
 		var ghHelper string
@@ -247,7 +267,7 @@ func TestIntegration(t *testing.T) {
 	t.Run("git does not create missing parent dir", func(t *testing.T) {
 		requireTools(t, "git")
 		s := newSandbox(t)
-		if _, err := os.Stat(s.p.GitConfigDir); !errors.Is(err, fs.ErrNotExist) {
+		if _, err := os.Stat(s.id.GitConfigDir); !errors.Is(err, fs.ErrNotExist) {
 			t.Fatalf("precondition: GitConfigDir must not exist: stat err = %v", err)
 		}
 
@@ -260,10 +280,10 @@ func TestIntegration(t *testing.T) {
 		if !strings.Contains(r.stderr, "could not lock config file") {
 			t.Errorf("stderr does not contain `could not lock config file`: %q", r.stderr)
 		}
-		if _, err := os.Stat(s.p.GitConfigDir); !errors.Is(err, fs.ErrNotExist) {
+		if _, err := os.Stat(s.id.GitConfigDir); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("GitConfigDir was created: stat err = %v", err)
 		}
-		if _, err := os.Stat(s.p.GitConfigFile); !errors.Is(err, fs.ErrNotExist) {
+		if _, err := os.Stat(s.id.GitConfigFile); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("GitConfigFile was created: stat err = %v", err)
 		}
 	})

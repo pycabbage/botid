@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -277,6 +278,59 @@ func TestDotEnv(t *testing.T) {
 		"GIT_CONFIG_GLOBAL='/home/alice/.local/share/botid/git/config'\n"
 	if got != want {
 		t.Errorf("DotEnv = %q, want %q", got, want)
+	}
+}
+
+func TestJSONEnv(t *testing.T) {
+	got, err := JSONEnv("/home/alice/.local/share/botid/identities/bot/gh", "/home/alice/.local/share/botid/identities/bot/git/config")
+	if err != nil {
+		t.Fatalf("JSONEnv: %v", err)
+	}
+	want := `{"GH_CONFIG_DIR":"/home/alice/.local/share/botid/identities/bot/gh","GIT_CONFIG_GLOBAL":"/home/alice/.local/share/botid/identities/bot/git/config"}` + "\n"
+	if got != want {
+		t.Errorf("JSONEnv = %q, want %q", got, want)
+	}
+}
+
+func TestJSONEnvEscapesSpecialCharacters(t *testing.T) {
+	got, err := JSONEnv(`/home/o'b"rien/gh`, "/home/a b/git/config")
+	if err != nil {
+		t.Fatalf("JSONEnv: %v", err)
+	}
+	want := `{"GH_CONFIG_DIR":"/home/o'b\"rien/gh","GIT_CONFIG_GLOBAL":"/home/a b/git/config"}` + "\n"
+	if got != want {
+		t.Errorf("JSONEnv = %q, want %q", got, want)
+	}
+}
+
+func TestJSONEnvRejectsRelativePaths(t *testing.T) {
+	const okGH = "/home/alice/.local/share/botid/gh"
+	const okGit = "/home/alice/.local/share/botid/git/config"
+	tests := []struct {
+		name    string
+		gh, git string
+		want    string
+	}{
+		{"relative gh dir", "gh", okGit, "GH_CONFIG_DIR is not an absolute path"},
+		{"relative git config", okGH, "git/config", "GIT_CONFIG_GLOBAL is not an absolute path"},
+		{"tilde gh dir", "~/gh", okGit, "GH_CONFIG_DIR is not an absolute path"},
+		{"empty gh dir", "", okGit, "GH_CONFIG_DIR is not an absolute path"},
+		{"empty git config", okGH, "", "GIT_CONFIG_GLOBAL is not an absolute path"},
+		{"both relative", "gh", "git/config", "GH_CONFIG_DIR is not an absolute path"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := JSONEnv(tt.gh, tt.git)
+			if err == nil {
+				t.Fatalf("JSONEnv(%q, %q) = %q, want error", tt.gh, tt.git, got)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error = %q, want substring %q", err, tt.want)
+			}
+			if got != "" {
+				t.Errorf("JSONEnv returned %q alongside error, want empty string", got)
+			}
+		})
 	}
 }
 

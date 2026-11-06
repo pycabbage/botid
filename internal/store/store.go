@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -95,6 +96,26 @@ func DotEnv(ghConfigDir, gitConfigGlobal string) (string, error) {
 	}
 	return "GH_CONFIG_DIR='" + ghConfigDir + "'\n" +
 		"GIT_CONFIG_GLOBAL='" + gitConfigGlobal + "'\n", nil
+}
+
+// JSONEnv returns the variables of DotEnv as one JSON object followed by a newline.
+func JSONEnv(ghConfigDir, gitConfigGlobal string) (string, error) {
+	for _, v := range []struct{ name, path string }{
+		{"GH_CONFIG_DIR", ghConfigDir},
+		{"GIT_CONFIG_GLOBAL", gitConfigGlobal},
+	} {
+		if !filepath.IsAbs(v.path) {
+			return "", fmt.Errorf("%s is not an absolute path: %q", v.name, v.path)
+		}
+	}
+	data, err := json.Marshal(struct {
+		GHConfigDir     string `json:"GH_CONFIG_DIR"`
+		GitConfigGlobal string `json:"GIT_CONFIG_GLOBAL"`
+	}{ghConfigDir, gitConfigGlobal})
+	if err != nil {
+		return "", fmt.Errorf("cannot encode the variables as JSON: %w", err)
+	}
+	return string(data) + "\n", nil
 }
 
 func checkEnvPath(name, p string) error {

@@ -7,15 +7,24 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/pycabbage/botid/internal/config"
 	"github.com/pycabbage/botid/internal/ghapp"
 )
 
 var (
 	alice = ghapp.Installation{ID: 42, Login: "alice"}
 	acme  = ghapp.Installation{ID: 77, Login: "acme-org"}
+)
+
+const (
+	configPath   = ".config/botid/config.json"
+	identityKey  = ".config/botid/identities/my-app/private-key.pem"
+	identityData = ".local/share/botid/identities/my-app"
+	legacyConfig = "{\"clientId\":\"old-client\",\"privateKeyPath\":\"/old/key.pem\",\"installationId\":1}\n"
 )
 
 func requireSystemd(t *testing.T) {
@@ -25,25 +34,38 @@ func requireSystemd(t *testing.T) {
 	}
 }
 
-func (h *harness) writeExistingConfig() {
+func (h *harness) writeLegacyConfig() {
 	h.t.Helper()
-	h.write(".config/botid/config.json", "{\"clientId\":\"old-client\",\"privateKeyPath\":\"/old/key.pem\",\"installationId\":1}\n")
+	h.write(configPath, legacyConfig)
 	h.write(".config/botid/private-key.pem", "old key")
+	h.write(".local/share/botid/gh/hosts.yml", "old hosts")
+	h.write(".local/share/botid/git/config", "old git config")
 }
 
-func (h *harness) assertExistingConfigIntact() {
+func (h *harness) assertLegacyFilesKept() {
 	h.t.Helper()
-	if got := h.read(".config/botid/config.json"); got != "{\"clientId\":\"old-client\",\"privateKeyPath\":\"/old/key.pem\",\"installationId\":1}\n" {
+	if got := h.read(".config/botid/private-key.pem"); got != "old key" {
+		h.t.Errorf("the old private-key.pem was changed: %q", got)
+	}
+	if got := h.read(".local/share/botid/gh/hosts.yml"); got != "old hosts" {
+		h.t.Errorf("the old hosts.yml was changed: %q", got)
+	}
+	if got := h.read(".local/share/botid/git/config"); got != "old git config" {
+		h.t.Errorf("the old git config was changed: %q", got)
+	}
+}
+
+func (h *harness) assertLegacyIntact() {
+	h.t.Helper()
+	if got := h.read(configPath); got != legacyConfig {
 		h.t.Errorf("config.json was changed: %q", got)
 	}
-	if got := h.read(".config/botid/private-key.pem"); got != "old key" {
-		h.t.Errorf("private-key.pem was changed: %q", got)
-	}
+	h.assertLegacyFilesKept()
 	if got := h.entries(".config/botid"); !equalLines(got, []string{"config.json", "private-key.pem"}) {
 		h.t.Errorf(".config/botid contents = %v", got)
 	}
-	if got := h.entries(".local"); got != nil {
-		h.t.Errorf("output directory was created: %v", got)
+	if got := h.entries(".local/share/botid"); !equalLines(got, []string{"gh", "git"}) {
+		h.t.Errorf(".local/share/botid contents = %v, want [gh git]", got)
 	}
 	if got := h.entries(".config"); !equalLines(got, []string{"botid"}) {
 		h.t.Errorf(".config contents = %v, want [botid]", got)
@@ -54,6 +76,56 @@ func (h *harness) assertExistingConfigIntact() {
 	if got := h.gh.requests(); len(got) != 0 {
 		h.t.Errorf("requests were sent to GitHub: %v", got)
 	}
+}
+
+func existingConfig() config.Config {
+	return config.Config{
+		Default: "my-app",
+		Identities: map[string]config.Identity{
+			"my-app": {ClientID: "old-client", PrivateKeyPath: "/old/my-app.pem", InstallationID: 1},
+			"other":  {ClientID: "other-client", PrivateKeyPath: "/old/other.pem", InstallationID: 2},
+		},
+		Rules: []config.Rule{
+			{Remote: "github.com/octocorp/*", Identity: "other"},
+			{Path: "~/src/private/**", Branch: "release/**", Identity: "user"},
+		},
+	}
+}
+
+func (h *harness) writeExistingIdentities() (before string) {
+	h.t.Helper()
+	h.saveConfig(existingConfig())
+	h.write(identityKey, "old key")
+	h.write(identityData+"/gh/hosts.yml", "old hosts")
+	return h.read(configPath)
+}
+
+func (h *harness) assertExistingIdentitiesIntact(before string) {
+	h.t.Helper()
+	if got := h.read(configPath); got != before {
+		h.t.Errorf("config.json was changed:\n%s\nwant\n%s", got, before)
+	}
+	if got := h.read(identityKey); got != "old key" {
+		h.t.Errorf("private-key.pem was changed: %q", got)
+	}
+	if got := h.read(identityData + "/gh/hosts.yml"); got != "old hosts" {
+		h.t.Errorf("hosts.yml was changed: %q", got)
+	}
+	if got := h.entries(".config/botid/identities"); !equalLines(got, []string{"my-app"}) {
+		h.t.Errorf("identity directories = %v, want [my-app]", got)
+	}
+	if got := h.rec.lines(); len(got) != 0 {
+		h.t.Errorf("external commands were run: %v", got)
+	}
+}
+
+func (h *harness) loadSavedConfig() config.Config {
+	h.t.Helper()
+	c, err := config.Load(h.path(configPath))
+	if err != nil {
+		h.t.Fatalf("config.json cannot be loaded: %v", err)
+	}
+	return c
 }
 
 // assertInitRejectedBeforeAnySideEffect checks that Init failed with an error containing want
@@ -109,9 +181,9 @@ func TestInitRejectsGoRunBinaryBeforeAnySideEffect(t *testing.T) {
 		}
 	})
 
-	t.Run("existing config.json is not asked about and stays byte-identical", func(t *testing.T) {
+	t.Run("a config.json of botid v0.1.0 is not migrated and stays byte-identical", func(t *testing.T) {
 		h := newHarness(t, "", alice)
-		h.writeExistingConfig()
+		h.writeLegacyConfig()
 		h.app.Exe = func() (string, error) { return "/home/x/.cache/go-build/ab/cd-d/botid", nil }
 		stdin := strings.NewReader("y\n" + input)
 		h.app.Stdin = stdin
@@ -119,7 +191,7 @@ func TestInitRejectsGoRunBinaryBeforeAnySideEffect(t *testing.T) {
 		err := h.app.Init(context.Background())
 
 		h.assertInitRejectedBeforeAnySideEffect(err, "cannot create units from a temporary or go run executable", stdin, len("y\n"+input))
-		h.assertExistingConfigIntact()
+		h.assertLegacyIntact()
 		if strings.Contains(h.stdout.String(), "Overwrite?") {
 			t.Errorf("the overwrite prompt was printed: %q", h.stdout.String())
 		}
@@ -168,25 +240,39 @@ func TestInitWithPastedPEMSingleInstallation(t *testing.T) {
 	}
 
 	wantConfig := "{\n" +
-		"  \"clientId\": \"Iv23liTEST\",\n" +
-		"  \"privateKeyPath\": \"" + h.home + "/.config/botid/private-key.pem\",\n" +
-		"  \"installationId\": 42\n" +
+		"  \"default\": \"my-app\",\n" +
+		"  \"identities\": {\n" +
+		"    \"my-app\": {\n" +
+		"      \"clientId\": \"Iv23liTEST\",\n" +
+		"      \"privateKeyPath\": \"" + h.home + "/.config/botid/identities/my-app/private-key.pem\",\n" +
+		"      \"installationId\": 42\n" +
+		"    }\n" +
+		"  }\n" +
 		"}\n"
-	if got := h.read(".config/botid/config.json"); got != wantConfig {
+	if got := h.read(configPath); got != wantConfig {
 		t.Errorf("config.json =\n%s\nwant\n%s", got, wantConfig)
 	}
-	if got := h.read(".config/botid/private-key.pem"); got != pem {
+	if got := h.read(identityKey); got != pem {
 		t.Errorf("private-key.pem = %q, want it to match the pasted PEM", got)
 	}
-	if got := h.read(".local/share/botid/gh/hosts.yml"); got != wantHosts {
+	if got := h.read(identityData + "/gh/hosts.yml"); got != wantHosts {
 		t.Errorf("hosts.yml =\n%s\nwant\n%s", got, wantHosts)
 	}
-	for _, f := range []string{".config/botid/config.json", ".config/botid/private-key.pem", ".local/share/botid/gh/hosts.yml"} {
+	for _, f := range []string{configPath, identityKey, identityData + "/gh/hosts.yml"} {
 		if m := h.mode(f); m != 0o600 {
 			t.Errorf("%s mode = %o, want 600", f, m)
 		}
 	}
-	for _, d := range []string{".config/botid", ".local/share/botid", ".local/share/botid/gh", ".local/share/botid/git"} {
+	for _, d := range []string{
+		".config/botid",
+		".config/botid/identities",
+		".config/botid/identities/my-app",
+		".local/share/botid",
+		".local/share/botid/identities",
+		identityData,
+		identityData + "/gh",
+		identityData + "/git",
+	} {
 		if m := h.mode(d); m != 0o700 {
 			t.Errorf("%s mode = %o, want 700", d, m)
 		}
@@ -205,7 +291,7 @@ func TestInitAcceptsPKCS8PastedPEM(t *testing.T) {
 	if err := h.app.Init(context.Background()); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	if got := h.read(".config/botid/private-key.pem"); got != pem {
+	if got := h.read(identityKey); got != pem {
 		t.Errorf("private-key.pem = %q, want it to match the pasted PEM", got)
 	}
 }
@@ -225,13 +311,13 @@ func TestInitWithPrivateKeyFilePathStoresPEMContents(t *testing.T) {
 		if err := h.app.Init(context.Background()); err != nil {
 			t.Fatalf("Init: %v", err)
 		}
-		if got := h.read(".config/botid/private-key.pem"); got != pem {
+		if got := h.read(identityKey); got != pem {
 			t.Errorf("private-key.pem = %q, want it to match the PEM in the file", got)
 		}
-		if m := h.mode(".config/botid/private-key.pem"); m != 0o600 {
+		if m := h.mode(identityKey); m != 0o600 {
 			t.Errorf("private-key.pem mode = %o, want 600", m)
 		}
-		if got := h.read(".config/botid/config.json"); !strings.Contains(got, `"privateKeyPath": "`+h.home+`/.config/botid/private-key.pem"`) {
+		if got := h.read(configPath); !strings.Contains(got, `"privateKeyPath": "`+h.home+`/.config/botid/identities/my-app/private-key.pem"`) {
 			t.Errorf("privateKeyPath in config.json does not point to the botid copy: %s", got)
 		}
 	})
@@ -244,7 +330,7 @@ func TestInitWithPrivateKeyFilePathStoresPEMContents(t *testing.T) {
 		if err := h.app.Init(context.Background()); err != nil {
 			t.Fatalf("Init: %v", err)
 		}
-		if got := h.read(".config/botid/private-key.pem"); got != pem {
+		if got := h.read(identityKey); got != pem {
 			t.Errorf("private-key.pem = %q, want it to match the PEM in the file", got)
 		}
 	})
@@ -279,7 +365,7 @@ func TestInitInstallationSelection(t *testing.T) {
 				t.Errorf("stdout does not contain %q: %q", want, out)
 			}
 		}
-		if got := h.read(".config/botid/config.json"); !strings.Contains(got, `"installationId": 77`) {
+		if got := h.read(configPath); !strings.Contains(got, `"installationId": 77`) {
 			t.Errorf("the selected installationId was not saved: %s", got)
 		}
 		wantReqs := []string{
@@ -298,7 +384,7 @@ func TestInitInstallationSelection(t *testing.T) {
 		if err := h.app.Init(context.Background()); err != nil {
 			t.Fatalf("Init: %v", err)
 		}
-		if got := h.read(".config/botid/config.json"); !strings.Contains(got, `"installationId": 42`) {
+		if got := h.read(configPath); !strings.Contains(got, `"installationId": 42`) {
 			t.Errorf("the selected installationId was not saved: %s", got)
 		}
 	})
@@ -426,17 +512,19 @@ func TestInitDirectoryLayout(t *testing.T) {
 		t.Fatalf("Init: %v", err)
 	}
 
-	if got := h.entries(".config/botid"); !equalLines(got, []string{"config.json", "private-key.pem"}) {
-		t.Errorf(".config/botid contents = %v, want [config.json private-key.pem]", got)
-	}
-	if got := h.entries(".local/share/botid"); !equalLines(got, []string{"gh", "git"}) {
-		t.Errorf(".local/share/botid contents = %v, want [gh git]", got)
-	}
-	if got := h.entries(".local/share/botid/gh"); !equalLines(got, []string{"hosts.yml"}) {
-		t.Errorf(".local/share/botid/gh contents = %v, want [hosts.yml]", got)
-	}
-	if got := h.entries(".config"); !equalLines(got, []string{"botid", "systemd"}) {
-		t.Errorf(".config contents = %v, want [botid systemd]", got)
+	for rel, want := range map[string][]string{
+		".config":                                 {"botid", "systemd"},
+		".config/botid":                           {"config.json", "identities"},
+		".config/botid/identities":                {"my-app"},
+		".config/botid/identities/my-app":         {"private-key.pem"},
+		".local/share/botid":                      {"identities"},
+		".local/share/botid/identities":           {"my-app"},
+		".local/share/botid/identities/my-app":    {"gh", "git"},
+		".local/share/botid/identities/my-app/gh": {"hosts.yml"},
+	} {
+		if got := h.entries(rel); !equalLines(got, want) {
+			t.Errorf("%s contents = %v, want %v", rel, got, want)
+		}
 	}
 	if got := h.entries(".gitconfig"); got != nil {
 		t.Errorf("~/.gitconfig was touched: %v", got)
@@ -463,8 +551,8 @@ func TestInitRunsGitAndGhIsolatedThenSystemdLast(t *testing.T) {
 	}
 
 	wantEnv := []string{
-		"GH_CONFIG_DIR=" + h.home + "/.local/share/botid/gh",
-		"GIT_CONFIG_GLOBAL=" + h.home + "/.local/share/botid/git/config",
+		"GH_CONFIG_DIR=" + h.home + "/.local/share/botid/identities/my-app/gh",
+		"GIT_CONFIG_GLOBAL=" + h.home + "/.local/share/botid/identities/my-app/git/config",
 	}
 	for _, c := range h.rec.calls[:3] {
 		if !equalLines(c.Env, wantEnv) {
@@ -538,7 +626,7 @@ func TestInitInstallsSystemdUnitsForTheRunningExecutable(t *testing.T) {
 	}
 }
 
-func TestInitPrintsSummaryWithEnvAndLingerGuidance(t *testing.T) {
+func TestInitPrintsSummaryWithRulesAndLingerGuidance(t *testing.T) {
 	requireSystemd(t)
 	h := newHarness(t, testClientID+"\n"+pkcs1PEM(t), alice)
 
@@ -549,63 +637,303 @@ func TestInitPrintsSummaryWithEnvAndLingerGuidance(t *testing.T) {
 	out := h.stdout.String()
 	for _, want := range []string{
 		"botid init is complete.",
+		"Identity:     my-app (default)",
 		h.home + "/.config/botid/config.json",
-		h.home + "/.config/botid/private-key.pem",
-		h.home + "/.local/share/botid/gh/hosts.yml (my-app[bot])",
-		h.home + "/.local/share/botid/git/config",
+		h.home + "/.config/botid/identities/my-app/private-key.pem",
+		h.home + "/.local/share/botid/identities/my-app/gh/hosts.yml (my-app[bot])",
+		h.home + "/.local/share/botid/identities/my-app/git/config",
 		"enabled botid-issue.timer (runs botid issue every 45 minutes)",
-		"Run botid env and set the printed environment variables once in the coding agent's environment.",
+		`add rules to "rules" in ` + h.home + "/.config/botid/config.json",
 		"loginctl enable-linger",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stdout does not contain %q:\n%s", want, out)
 		}
 	}
+	if strings.Contains(out, "botid env") {
+		t.Errorf("stdout still tells the user to run botid env:\n%s", out)
+	}
 	h.assertNoOutputLeaksToken()
 }
 
-func TestInitExistingConfigConfirmation(t *testing.T) {
+func TestInitAddsASecondIdentityAndKeepsDefaultAndRules(t *testing.T) {
 	requireSystemd(t)
+	h := newHarness(t, testClientID+"\n"+pkcs1PEM(t), alice)
+	h.gh.slug = "other-app"
+	before := h.writeExistingIdentities()
 
-	t.Run("y overwrites", func(t *testing.T) {
-		h := newHarness(t, "y\n"+testClientID+"\n"+pkcs1PEM(t), alice)
-		h.writeExistingConfig()
+	if err := h.app.Init(context.Background()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	want := existingConfig()
+	want.Identities["other-app"] = config.Identity{
+		ClientID:       testClientID,
+		PrivateKeyPath: h.path(".config/botid/identities/other-app/private-key.pem"),
+		InstallationID: 42,
+	}
+	if got := h.loadSavedConfig(); !reflect.DeepEqual(got, want) {
+		t.Errorf("config.json = %+v, want %+v", got, want)
+	}
+	if got := h.read(".config/botid/identities/other-app/private-key.pem"); got != pkcs1PEM(t) {
+		t.Errorf("the private key of the new identity was not written: %q", got)
+	}
+	if got := h.read(".local/share/botid/identities/other-app/gh/hosts.yml"); !strings.Contains(got, `"other-app[bot]"`) {
+		t.Errorf("hosts.yml of the new identity = %q", got)
+	}
+	if got := h.read(identityKey); got != "old key" {
+		t.Errorf("the key of the other identity was changed: %q", got)
+	}
+	if got := h.read(identityData + "/gh/hosts.yml"); got != "old hosts" {
+		t.Errorf("hosts.yml of the other identity was changed: %q", got)
+	}
+	if before == h.read(configPath) {
+		t.Error("config.json was not updated")
+	}
+	if got := h.stderr.String(); got != "" {
+		t.Errorf("stderr = %q, want it empty (no identity was replaced)", got)
+	}
+	out := h.stdout.String()
+	if !strings.Contains(out, "Identity:     other-app (not the default)") || strings.Contains(out, "Overwrite?") {
+		t.Errorf("stdout = %q", out)
+	}
+	wantCalls := []string{
+		"git config --global user.name other-app[bot]",
+		"git config --global user.email 123456+other-app[bot]@users.noreply.github.com",
+		"gh auth setup-git",
+		"systemctl --user daemon-reload",
+		"systemctl --user enable --now botid-issue.timer",
+	}
+	if got := h.rec.lines(); !equalLines(got, wantCalls) {
+		t.Errorf("external command calls =\n%v\nwant\n%v", got, wantCalls)
+	}
+	wantEnv := []string{
+		"GH_CONFIG_DIR=" + h.home + "/.local/share/botid/identities/other-app/gh",
+		"GIT_CONFIG_GLOBAL=" + h.home + "/.local/share/botid/identities/other-app/git/config",
+	}
+	for _, c := range h.rec.calls[:3] {
+		if !equalLines(c.Env, wantEnv) {
+			t.Errorf("env passed to %s = %v, want %v", c.line(), c.Env, wantEnv)
+		}
+	}
+}
+
+func TestInitKeepsTheUserIdentityAsDefault(t *testing.T) {
+	requireSystemd(t)
+	h := newHarness(t, testClientID+"\n"+pkcs1PEM(t), alice)
+	h.saveConfig(config.Config{Default: config.User, Rules: []config.Rule{{Path: "/srv/**", Identity: config.User}}})
+
+	if err := h.app.Init(context.Background()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	want := config.Config{
+		Default: config.User,
+		Identities: map[string]config.Identity{
+			"my-app": {ClientID: testClientID, PrivateKeyPath: h.path(identityKey), InstallationID: 42},
+		},
+		Rules: []config.Rule{{Path: "/srv/**", Identity: config.User}},
+	}
+	if got := h.loadSavedConfig(); !reflect.DeepEqual(got, want) {
+		t.Errorf("config.json = %+v, want %+v", got, want)
+	}
+	if !strings.Contains(h.stdout.String(), "Identity:     my-app (not the default)") {
+		t.Errorf("stdout = %q", h.stdout.String())
+	}
+}
+
+func TestInitExistingIdentityConfirmation(t *testing.T) {
+	requireSystemd(t)
+	warning := func(h *harness) string {
+		return `Warning: identity "my-app" already exists in ` + h.home + "/.config/botid/config.json. If you continue, its credentials and private key will be overwritten.\n"
+	}
+
+	t.Run("y replaces that identity and keeps the rest", func(t *testing.T) {
+		h := newHarness(t, testClientID+"\n"+pkcs1PEM(t)+"y\n", alice)
+		h.writeExistingIdentities()
 
 		if err := h.app.Init(context.Background()); err != nil {
 			t.Fatalf("Init: %v", err)
 		}
-		if got := h.read(".config/botid/config.json"); !strings.Contains(got, `"clientId": "Iv23liTEST"`) || !strings.Contains(got, `"installationId": 42`) {
-			t.Errorf("config.json was not overwritten: %s", got)
+
+		want := existingConfig()
+		want.Identities["my-app"] = config.Identity{
+			ClientID:       testClientID,
+			PrivateKeyPath: h.path(identityKey),
+			InstallationID: 42,
 		}
-		if got := h.read(".config/botid/private-key.pem"); got != pkcs1PEM(t) {
+		if got := h.loadSavedConfig(); !reflect.DeepEqual(got, want) {
+			t.Errorf("config.json = %+v, want %+v", got, want)
+		}
+		if got := h.read(identityKey); got != pkcs1PEM(t) {
 			t.Errorf("private-key.pem was not overwritten: %q", got)
 		}
-		if got := h.stderr.String(); got != "Warning: "+h.home+"/.config/botid/config.json already exists. If you continue, the configuration and private key will be overwritten.\n" {
-			t.Errorf("stderr = %q", got)
+		if got := h.read(identityData + "/gh/hosts.yml"); got != wantHosts {
+			t.Errorf("hosts.yml was not overwritten: %q", got)
+		}
+		if got := h.stderr.String(); got != warning(h) {
+			t.Errorf("stderr = %q, want %q", got, warning(h))
 		}
 		if !strings.Contains(h.stdout.String(), "Overwrite? [y/n]: ") {
 			t.Errorf("stdout does not contain the confirmation prompt: %q", h.stdout.String())
 		}
+		if !strings.Contains(h.stdout.String(), "Identity:     my-app (default)") {
+			t.Errorf("stdout = %q, want my-app reported as the default", h.stdout.String())
+		}
 	})
 
 	for _, tt := range []struct {
-		name  string
-		input string
+		name   string
+		answer string
 	}{
-		{"n changes nothing", "n\n" + testClientID + "\n" + pkcs1PEM(t)},
+		{"n changes nothing", "n\n"},
 		{"EOF changes nothing", ""},
-		{"empty line changes nothing", "\n" + testClientID + "\n" + pkcs1PEM(t)},
-		{"Y (uppercase) is not treated as y", "Y\n" + testClientID + "\n" + pkcs1PEM(t)},
-		{"yes is not treated as y", "yes\n" + testClientID + "\n" + pkcs1PEM(t)},
+		{"empty line changes nothing", "\n"},
+		{"Y (uppercase) is not treated as y", "Y\n"},
+		{"yes is not treated as y", "yes\n"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			h := newHarness(t, tt.input, alice)
-			h.writeExistingConfig()
+			h := newHarness(t, testClientID+"\n"+pkcs1PEM(t)+tt.answer, alice)
+			before := h.writeExistingIdentities()
 
 			if err := h.app.Init(context.Background()); err != nil {
 				t.Fatalf("Init returned an error (expected exit code 0): %v", err)
 			}
-			h.assertExistingConfigIntact()
+
+			h.assertExistingIdentitiesIntact(before)
+			if got := h.stderr.String(); got != warning(h) {
+				t.Errorf("stderr = %q, want %q", got, warning(h))
+			}
+			if !strings.Contains(h.stdout.String(), "Exited without changing anything.") {
+				t.Errorf("stdout = %q", h.stdout.String())
+			}
+			if strings.Contains(h.stdout.String(), "botid init is complete") {
+				t.Errorf("completion message was printed: %q", h.stdout.String())
+			}
+		})
+	}
+}
+
+func TestInitMigratesAConfigOfBotidV010First(t *testing.T) {
+	requireSystemd(t)
+	warning := func(h *harness) string {
+		return h.migrationNotice() + `Warning: identity "my-app" already exists in ` + h.home + "/.config/botid/config.json. If you continue, its credentials and private key will be overwritten.\n"
+	}
+
+	t.Run("y replaces the migrated identity", func(t *testing.T) {
+		h := newHarness(t, testClientID+"\n"+pkcs1PEM(t)+"y\n", alice)
+		h.writeMigratableConfig()
+
+		if err := h.app.Init(context.Background()); err != nil {
+			t.Fatalf("Init: %v", err)
+		}
+
+		want := config.Config{
+			Default: "my-app",
+			Identities: map[string]config.Identity{
+				"my-app": {ClientID: testClientID, PrivateKeyPath: h.path(identityKey), InstallationID: 42},
+			},
+		}
+		if got := h.loadSavedConfig(); !reflect.DeepEqual(got, want) {
+			t.Errorf("config.json = %+v, want %+v", got, want)
+		}
+		if got := h.read(identityData + "/git/config"); got != legacyGitConfig {
+			t.Errorf("the moved git config = %q, want %q", got, legacyGitConfig)
+		}
+		if got := h.stderr.String(); got != warning(h) {
+			t.Errorf("stderr = %q, want %q", got, warning(h))
+		}
+		if !strings.Contains(h.stdout.String(), "Identity:     my-app (default)") {
+			t.Errorf("stdout = %q", h.stdout.String())
+		}
+	})
+
+	t.Run("n keeps the migrated identity", func(t *testing.T) {
+		h := newHarness(t, testClientID+"\n"+pkcs1PEM(t)+"n\n", alice)
+		h.writeMigratableConfig()
+
+		if err := h.app.Init(context.Background()); err != nil {
+			t.Fatalf("Init returned an error (expected exit code 0): %v", err)
+		}
+
+		if got := h.loadSavedConfig(); !reflect.DeepEqual(got, h.migratedConfig()) {
+			t.Errorf("config.json = %+v, want %+v", got, h.migratedConfig())
+		}
+		if got := h.read(legacyKeyPath); got != pkcs1PEM(t) {
+			t.Errorf("the private key was changed: %q", got)
+		}
+		if got := h.stderr.String(); got != warning(h) {
+			t.Errorf("stderr = %q, want %q", got, warning(h))
+		}
+		if !strings.Contains(h.stdout.String(), "Exited without changing anything.") {
+			t.Errorf("stdout = %q", h.stdout.String())
+		}
+	})
+}
+
+func TestInitNeverOverwritesAConfigItCannotRead(t *testing.T) {
+	requireSystemd(t)
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"unknown identity in a rule", `{"default":"user","identities":{},"rules":[{"remote":"a/*","identity":"nobody"}]}`, `unknown identity "nobody"`},
+		{"not JSON", "{broken", "cannot read"},
+		{"hand-written unknown key", `{"default":"user","identities":{},"note":"mine"}`, `unknown field "note"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, "y\n"+testClientID+"\n"+pkcs1PEM(t), alice)
+			h.write(configPath, tt.body)
+
+			err := h.app.Init(context.Background())
+
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want substring %q", err, tt.want)
+			}
+			if got := h.read(configPath); got != tt.body {
+				t.Errorf("config.json was changed: %q", got)
+			}
+			if got := h.stdout.String(); got != "" {
+				t.Errorf("stdout = %q, want no prompt", got)
+			}
+			if got := h.gh.requests(); len(got) != 0 {
+				t.Errorf("requests were sent to GitHub: %v", got)
+			}
+			if got := h.rec.lines(); len(got) != 0 {
+				t.Errorf("external commands were run: %v", got)
+			}
+			if got := h.entries(".config/botid"); !equalLines(got, []string{"config.json"}) {
+				t.Errorf(".config/botid contents = %v", got)
+			}
+		})
+	}
+}
+
+func TestInitRejectsAppSlugThatCannotBeAnIdentityName(t *testing.T) {
+	requireSystemd(t)
+	tests := []struct {
+		slug string
+		want string
+	}{
+		{"user", `identity name "user" is reserved for the built-in identity`},
+		{".hidden", `identity name ".hidden" must match`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.slug, func(t *testing.T) {
+			h := newHarness(t, testClientID+"\n"+pkcs1PEM(t), alice)
+			h.gh.slug = tt.slug
+
+			err := h.app.Init(context.Background())
+
+			if err == nil || !strings.Contains(err.Error(), "cannot use the App slug as an identity name") || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want substrings %q", err, tt.want)
+			}
+			h.assertHomeUntouched()
+			if got := h.rec.lines(); len(got) != 0 {
+				t.Errorf("external commands were run: %v", got)
+			}
 		})
 	}
 }
@@ -613,7 +941,7 @@ func TestInitExistingConfigConfirmation(t *testing.T) {
 func TestInitFailureAfterWritingKeepsWrittenFiles(t *testing.T) {
 	requireSystemd(t)
 
-	t.Run("written files are kept when git config fails", func(t *testing.T) {
+	t.Run("written files are kept and config.json is not written when git config fails", func(t *testing.T) {
 		h := newHarness(t, testClientID+"\n"+pkcs1PEM(t), alice)
 		h.rec.errs["git config --global user.name my-app[bot]"] = errors.New("exit status 128")
 		h.rec.out["git config --global user.name my-app[bot]"] = "fatal: cannot write\n"
@@ -622,14 +950,31 @@ func TestInitFailureAfterWritingKeepsWrittenFiles(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "git config --global user.name my-app[bot] failed") || !strings.Contains(err.Error(), "fatal: cannot write") {
 			t.Fatalf("error = %v", err)
 		}
-		if got := h.entries(".config/botid"); !equalLines(got, []string{"config.json", "private-key.pem"}) {
-			t.Errorf(".config/botid contents = %v", got)
+		if got := h.entries(".config/botid"); !equalLines(got, []string{"identities"}) {
+			t.Errorf(".config/botid contents = %v, want config.json to be written last", got)
 		}
-		if got := h.read(".local/share/botid/gh/hosts.yml"); got != wantHosts {
+		if got := h.read(identityKey); got != pkcs1PEM(t) {
+			t.Errorf("private-key.pem was not kept: %q", got)
+		}
+		if got := h.read(identityData + "/gh/hosts.yml"); got != wantHosts {
 			t.Errorf("hosts.yml was not kept: %q", got)
 		}
 		if got := h.rec.lines(); !equalLines(got, []string{"git config --global user.name my-app[bot]"}) {
 			t.Errorf("external command calls = %v, want it to stop at the failure", got)
+		}
+	})
+
+	t.Run("an existing config.json is left unchanged when git config fails", func(t *testing.T) {
+		h := newHarness(t, testClientID+"\n"+pkcs1PEM(t), alice)
+		h.gh.slug = "other-app"
+		before := h.writeExistingIdentities()
+		h.rec.errs["gh auth setup-git"] = errors.New("exit status 1")
+
+		if err := h.app.Init(context.Background()); err == nil {
+			t.Fatal("expected an error")
+		}
+		if got := h.read(configPath); got != before {
+			t.Errorf("config.json was changed:\n%s\nwant\n%s", got, before)
 		}
 	})
 
@@ -672,10 +1017,13 @@ func TestInitFailureAfterWritingKeepsWrittenFiles(t *testing.T) {
 				t.Errorf("error = %q, want substring %q", err, want)
 			}
 		}
-		if got := h.entries(".config/botid"); !equalLines(got, []string{"config.json", "private-key.pem"}) {
+		if got := h.entries(".config/botid"); !equalLines(got, []string{"config.json", "identities"}) {
 			t.Errorf(".config/botid contents = %v", got)
 		}
-		if got := h.read(".local/share/botid/gh/hosts.yml"); got != wantHosts {
+		if got := h.loadSavedConfig(); got.Default != "my-app" || len(got.Identities) != 1 {
+			t.Errorf("config.json = %+v", got)
+		}
+		if got := h.read(identityData + "/gh/hosts.yml"); got != wantHosts {
 			t.Errorf("hosts.yml was not kept: %q", got)
 		}
 		if strings.Contains(h.stdout.String(), "botid init is complete") {
