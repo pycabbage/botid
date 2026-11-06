@@ -15,6 +15,7 @@ builds:
       - -trimpath
     ldflags:
       - -s -w
+      - -X github.com/pycabbage/botid/internal/version.Version={{ if .IsSnapshot }}{{ .ShortCommit }}{{ else }}{{ .Tag }}{{ end }}
 
 archives:
   - id: botid

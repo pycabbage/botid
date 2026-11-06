@@ -12,6 +12,7 @@ import (
 	"github.com/pycabbage/botid/internal/cmd"
 	"github.com/pycabbage/botid/internal/config"
 	"github.com/pycabbage/botid/internal/repo"
+	"github.com/pycabbage/botid/internal/version"
 )
 
 type result struct {
@@ -91,12 +92,56 @@ func TestUsageText(t *testing.T) {
 	want := "Usage: botid <command>\n" +
 		"\n" +
 		"Commands:\n" +
-		"  init   Set up credentials, git/gh isolation and the systemd timer\n" +
-		"  issue  Issue a GitHub App installation token and write it to the botid store\n" +
-		"  env    Print the environment variables that point gh and git at the identity selected for a directory, in .env or JSON format\n" +
-		"  help   Show this usage\n"
+		"  init     Set up credentials, git/gh isolation and the systemd timer\n" +
+		"  issue    Issue a GitHub App installation token and write it to the botid store\n" +
+		"  env      Print the environment variables that point gh and git at the identity selected for a directory, in .env or JSON format\n" +
+		"  version  Print the version\n" +
+		"  help     Show this usage\n"
 	if usage != want {
 		t.Errorf("usage =\n%s\nwant\n%s", usage, want)
+	}
+}
+
+func TestVersionPrintsTheVersionWithExitCode0(t *testing.T) {
+	old := version.Version
+	t.Cleanup(func() { version.Version = old })
+	version.Version = "from-ldflags"
+
+	for _, args := range [][]string{{"version"}, {"--version"}} {
+		t.Run(strings.Join(append([]string{"botid"}, args...), " "), func(t *testing.T) {
+			home := t.TempDir()
+			r := runWith(t, home, "", args...)
+			if r.code != 0 {
+				t.Errorf("exit code = %d, want 0", r.code)
+			}
+			if want := "botid version from-ldflags\n"; r.stdout != want {
+				t.Errorf("stdout = %q, want %q", r.stdout, want)
+			}
+			if r.stderr != "" {
+				t.Errorf("stderr = %q, want empty", r.stderr)
+			}
+			if r.appCalled {
+				t.Error("App was created when printing the version")
+			}
+			if entries, err := os.ReadDir(home); err != nil || len(entries) != 0 {
+				t.Errorf("home contents = %v (err %v), want it untouched", entries, err)
+			}
+		})
+	}
+}
+
+func TestVersionWithoutALinkedVersionPrintsWhatGoStamped(t *testing.T) {
+	old := version.Version
+	t.Cleanup(func() { version.Version = old })
+	version.Version = ""
+
+	r := runWith(t, t.TempDir(), "", "version")
+
+	if r.code != 0 {
+		t.Errorf("exit code = %d, want 0", r.code)
+	}
+	if want := "botid version " + version.String() + "\n"; r.stdout != want || version.String() == "" {
+		t.Errorf("stdout = %q, want %q", r.stdout, want)
 	}
 }
 
@@ -123,6 +168,8 @@ func TestExtraArgumentsExitWithCode2(t *testing.T) {
 	}{
 		{[]string{"init", "extra"}, "botid: unexpected extra arguments for init: [\"extra\"]\n\n" + usage},
 		{[]string{"issue", "--force"}, "botid: unexpected extra arguments for issue: [\"--force\"]\n\n" + usage},
+		{[]string{"version", "extra"}, "botid: unexpected extra arguments for version: [\"extra\"]\n\n" + usage},
+		{[]string{"--version", "-v"}, "botid: unexpected extra arguments for --version: [\"-v\"]\n\n" + usage},
 		{[]string{"env", "a", "b"}, "botid: unexpected extra arguments for env: [\"a\" \"b\"]\n\n" + usage},
 		{[]string{"env", "--cwd", ".", "a"}, "botid: unexpected extra arguments for env: [\"a\"]\n\n" + usage},
 		{[]string{"env", "--format", "yaml"}, "botid: --format must be dotenv or json, not \"yaml\"\n\n" + usage},

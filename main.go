@@ -14,15 +14,17 @@ import (
 	"github.com/pycabbage/botid/internal/paths"
 	"github.com/pycabbage/botid/internal/repo"
 	"github.com/pycabbage/botid/internal/systemd"
+	"github.com/pycabbage/botid/internal/version"
 )
 
 const usage = `Usage: botid <command>
 
 Commands:
-  init   Set up credentials, git/gh isolation and the systemd timer
-  issue  Issue a GitHub App installation token and write it to the botid store
-  env    Print the environment variables that point gh and git at the identity selected for a directory, in .env or JSON format
-  help   Show this usage
+  init     Set up credentials, git/gh isolation and the systemd timer
+  issue    Issue a GitHub App installation token and write it to the botid store
+  env      Print the environment variables that point gh and git at the identity selected for a directory, in .env or JSON format
+  version  Print the version
+  help     Show this usage
 `
 
 const githubAPI = "https://api.github.com"
@@ -91,6 +93,13 @@ func run(args []string, stdout, stderr io.Writer, newApp func() (*cmd.App, error
 	switch args[0] {
 	case "help", "-h", "--help":
 		_, _ = fmt.Fprint(stdout, usage)
+		return 0
+	case "version", "--version":
+		if len(args) > 1 {
+			_, _ = fmt.Fprintf(stderr, "botid: unexpected extra arguments for %s: %q\n\n%s", args[0], args[1:], usage)
+			return 2
+		}
+		_, _ = fmt.Fprintf(stdout, "botid version %s\n", version.String())
 		return 0
 	case "init", "issue":
 		if len(args) > 1 {
