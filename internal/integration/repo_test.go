@@ -158,8 +158,8 @@ func TestInspectWithRealGit(t *testing.T) {
 		root := isolateGit(t)
 		t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(root))
 
-		if got := inspect(t, root); !reflect.DeepEqual(got, repo.Info{}) {
-			t.Errorf("Inspect() = %+v, want empty Info", got)
+		if got, want := inspect(t, root), (repo.Info{Path: root}); !reflect.DeepEqual(got, want) {
+			t.Errorf("Inspect() = %+v, want %+v", got, want)
 		}
 	})
 

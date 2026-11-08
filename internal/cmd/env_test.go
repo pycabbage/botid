@@ -158,6 +158,36 @@ func TestEnvPrintsTheSelectedIdentity(t *testing.T) {
 	}
 }
 
+func TestEnvAppliesAPathRuleToADirectoryOutsideAnyRepository(t *testing.T) {
+	c := envConfig()
+	c.Rules = append(c.Rules, config.Rule{Path: "~/work/plain", Identity: "octocorp-bot"})
+	tests := []struct {
+		name string
+		cwd  string
+		want string
+	}{
+		{"the directory the rule names", "work/plain", "octocorp-bot"},
+		{"another directory", "work/other", "acme-bot"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, "")
+			h.envSetup(c, newFakeGitOutsideRepo())
+			if err := os.MkdirAll(h.path(tt.cwd), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := h.app.Env(context.Background(), h.path(tt.cwd), cmd.FormatDotEnv); err != nil {
+				t.Fatalf("Env: %v", err)
+			}
+
+			if got, want := h.stdout.String(), h.dotEnvOf(tt.want); got != want {
+				t.Errorf("stdout = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestEnvPrintsTheUserIdentityAsNothing(t *testing.T) {
 	c := envConfig()
 	c.Default = config.User

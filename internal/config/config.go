@@ -131,13 +131,11 @@ func (c Config) AppNames() []string {
 	return slices.Sorted(maps.Keys(c.Identities))
 }
 
-// Select returns the name of the identity to use for the repository described by info.
+// Select returns the name of the identity to use for the directory described by info.
 // A matching rule with a branch wins over every rule without one. Among each kind the first match in file order wins.
-// Outside a repository, and when no rule matches, it returns Default.
+// Outside a repository there are no remotes and no branch, so only a rule with just a path can match.
+// When no rule matches, it returns Default.
 func (c Config) Select(info repo.Info, home string) string {
-	if info.Path == "" {
-		return c.Default
-	}
 	for _, withBranch := range []bool{true, false} {
 		for _, r := range c.Rules {
 			if (r.Branch != "") == withBranch && r.matches(info, home) {

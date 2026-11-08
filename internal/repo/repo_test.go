@@ -129,12 +129,13 @@ func TestInspectOutsideRepository(t *testing.T) {
 	f := &fakeGit{replies: map[string]reply{
 		worktreeList: {err: &ExitError{Code: 128, Stderr: "fatal: not a git repository (or any of the parent directories): .git\n"}},
 	}}
-	got, err := Inspect(t.Context(), f.run, t.TempDir())
+	dir := t.TempDir()
+	got, err := Inspect(t.Context(), f.run, dir)
 	if err != nil {
 		t.Fatalf("Inspect() error = %v", err)
 	}
-	if !reflect.DeepEqual(got, Info{}) {
-		t.Errorf("Inspect() = %+v, want empty Info", got)
+	if want := (Info{Path: dir}); !reflect.DeepEqual(got, want) {
+		t.Errorf("Inspect() = %+v, want %+v", got, want)
 	}
 	if len(f.calls) != 1 {
 		t.Errorf("git ran %d times, want 1: %v", len(f.calls), f.calls)

@@ -16,7 +16,7 @@ import (
 // Info describes the repository that contains a directory.
 type Info struct {
 	// Path is the path of the main worktree, or of the repository directory for a bare repository.
-	// It is empty when the directory is not in a repository.
+	// For a directory outside any repository it is the directory itself, so that a path rule can still name it.
 	Path string
 	// Branch is the checked-out branch. It is empty when HEAD is detached or not under refs/heads/.
 	Branch string
@@ -57,7 +57,7 @@ func ExecGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
 }
 
 // Inspect reads the repository facts of cwd with run. A directory outside any repository
-// gives an empty Info and no error. Every other failure is an error.
+// gives an Info with only Path set, to cwd, and no error. Every other failure is an error.
 func Inspect(ctx context.Context, run Runner, cwd string) (Info, error) {
 	fi, err := os.Stat(cwd)
 	if err != nil {
@@ -73,7 +73,7 @@ func Inspect(ctx context.Context, run Runner, cwd string) (Info, error) {
 	out, err := run(ctx, cwd, "worktree", "list", "--porcelain", "-z")
 	if err != nil {
 		if exitErr, ok := errors.AsType[*ExitError](err); ok && exitErr.Code == 128 && strings.Contains(exitErr.Stderr, "not a git repository") {
-			return Info{}, nil
+			return Info{Path: cwd}, nil
 		}
 		return Info{}, fmt.Errorf("git worktree list: %w", err)
 	}

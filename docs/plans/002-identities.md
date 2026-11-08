@@ -36,7 +36,7 @@ This document is the requirements definition and the implementation plan for per
 | I-5 | A rule has both `path` and `remote`. | Both must match. | A rule that narrows by two keys is a conjunction. |
 | I-6 | Which rule wins when several match? | A matching branch rule wins over every repository rule. Among branch rules, and among repository rules, the first match in file order wins. If nothing matches, the default identity is used. | REQ-4 gives a branch a more specific identity than its repository. Example: `github.com/octocorp/anyproduct-x` matches both patterns in REQ-6. File order decides, and the user controls the order. |
 | I-7 | HEAD is detached, or not under `refs/heads/`. | The repository has no branch. No branch rule matches. Repository rules and the default still apply. | There is no branch name to match. |
-| I-8 | The directory is not inside a git repository. | The default identity is used. | REQ-2. |
+| I-8 | The directory is not inside a git repository. | Rules still apply. The "repository path" is the directory itself, and it has no remotes and no branch. So only a rule that has just `path` can match; every other rule does not. If nothing matches, the default identity is used. | A `path` pattern names a place on disk, and the instruction does not say that the place must be a git repository. Treating a plain directory as "no rule applies" made a `path` rule silently do nothing there. |
 | I-9 | A rule that applies to every repository. | `"path": "/**"`. A rule without `path` and without `remote` is invalid. | REQ-4 names a branch of a specific repository. No extra syntax is needed. |
 | I-10 | When is the identity decided? | At the start of each OpenCode shell command, from the command's working directory and the branch checked out at that moment. | OpenCode starts one process per command and fires the hook per command (§3). This gives REQ-4 between commands. |
 | I-11 | One identity per App? | An App identity holds one installation. Running `init` again for the same App replaces it. | Same as botid v0.1.0, which asks the user to choose one installation. |
@@ -113,10 +113,11 @@ git (documentation and source at tag v2.56.0):
 
 `Select(info, home)` is a function of the repository facts and the config only.
 
-1. If `info` says the directory is not in a repository, return `default`.
-2. Go through the rules that have `branch`, in file order. Return the `identity` of the first rule that matches.
-3. Go through the rules that have no `branch`, in file order. Return the `identity` of the first rule that matches.
-4. Return `default`.
+1. Go through the rules that have `branch`, in file order. Return the `identity` of the first rule that matches.
+2. Go through the rules that have no `branch`, in file order. Return the `identity` of the first rule that matches.
+3. Return `default`.
+
+For a directory outside any repository, `info.Path` is the directory itself, and `info.Remotes` and `info.Branch` are empty (§4.4). The steps are the same. A `remote` or `branch` key cannot match there, so only a rule with just `path` can.
 
 A rule matches when all of its present keys match:
 
@@ -164,7 +165,7 @@ A URL that cannot be parsed is an error that names the remote. It is not skipped
 Handling of failures:
 
 - `cwd` must be an existing directory. Otherwise `Inspect` fails with `cwd does not exist: <path>`. The command could not run in that directory either.
-- If step 1 fails with exit status 128 and its stderr contains `not a git repository`, the directory is not in a repository: `Inspect` returns an empty `Info` and no error. Every other failure (for example `dubious ownership`, or a git older than 2.36) is returned as an error that carries git's stderr. The identity then cannot be decided and the caller fails closed.
+- If step 1 fails with exit status 128 and its stderr contains `not a git repository`, the directory is not in a repository: `Inspect` returns an `Info` whose `Path` is `cwd` and whose other fields are empty, and no error. Every other failure (for example `dubious ownership`, or a git older than 2.36) is returned as an error that carries git's stderr. The identity then cannot be decided and the caller fails closed.
 - The git processes run with `LC_ALL=C` so the message text is stable, and without `GIT_CONFIG_GLOBAL` so that the result does not depend on the identity that was selected for a previous command. `~/.gitconfig` (including `insteadOf` rules) is read as usual.
 
 ## 5. `config.json` and directory layout
@@ -240,7 +241,7 @@ func Match(pattern, name string) bool        // the caller has validated the pat
 
 // internal/repo
 type Info struct {
-    Path    string   // repository path (§1.2); "" when the directory is not in a repository
+    Path    string   // repository path (§1.2); the directory itself when it is not in a repository
     Branch  string   // "" when there is no branch (§1.3 I-7)
     Remotes []string // normalized, lowercase, de-duplicated
 }
@@ -424,7 +425,7 @@ Each stage ends with `go vet ./...` and `go test ./...` passing. Stages 3 and 4 
 3. `paths`, `config`
    - `Load` tests: every rule of §5, the v0.1.0 file (`errors.Is(err, ErrLegacy)`), `LoadLegacy` for a key file, an inline key and an unset `installationId`, unknown fields, trailing content, unknown identity in `default` or in a rule, `user` as an identity key, a bad glob.
    - `Save` and `Load` round trip with 0600.
-   - `Select` tests: the two examples of REQ-6 on `github.com/octocorp/widget`, `github.com/someone/anyproduct-x` and `github.com/octocorp/anyproduct-x` (file order decides the last one); a branch rule beats a repository rule listed before it; no branch; not in a repository; `path` with `~/`; a `path` given through a symlinked directory; `remote` case; a rule with `path` and `remote`.
+   - `Select` tests: the two examples of REQ-6 on `github.com/octocorp/widget`, `github.com/someone/anyproduct-x` and `github.com/octocorp/anyproduct-x` (file order decides the last one); a branch rule beats a repository rule listed before it; no branch; not in a repository, with and without a `path` rule that names the directory; `path` with `~/`; a `path` given through a symlinked directory; `remote` case; a rule with `path` and `remote`.
 4. `cmd`, `store`, `main`
    - `Init`: first identity becomes the default; a second identity keeps `default` and `rules`; the same slug asks for confirmation; `n` and EOF change nothing; a v0.1.0 file is migrated first and `init` then asks about the same slug; a broken `config.json` is never overwritten; the config is written after the files; a failing git step leaves `config.json` unchanged; the slug `user` is rejected.
    - `Issue`: every identity gets its `hosts.yml`; one failing identity does not stop the others, the others are written, the exit code is 1 and the message names the failing identity; no App identity is a no-op; a missing file gives the message of §7.2; a v0.1.0 file is migrated and then issued.
@@ -454,7 +455,7 @@ End-to-end with a real OpenCode v2.2.5, run by hand with a throwaway harness und
 | Branch with a matching branch rule | The branch rule's identity |
 | `git switch` back and forth, one command per switch | The identity follows the branch from the next command on |
 | Rule identity `user`, and default `user` | Both variables empty |
-| Directory outside a repository | The default identity |
+| Directory outside a repository | The default identity, or the identity of a rule that has just `path` and names the directory |
 | `cwd` given as `.` and a relative path | Resolved against the project directory |
 | `botid` removed from `PATH`, or `config.json` broken | The command is not run, and `opencode.log` has the cause |
 

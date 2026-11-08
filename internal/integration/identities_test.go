@@ -193,6 +193,14 @@ func TestEnvSelectsTheIdentityForRealRepositoriesAndAppliesItToGhAndGit(t *testi
 	t.Run("the path rule selects the user identity", func(t *testing.T) {
 		check(t, notes, "user")
 	})
+	t.Run("a path rule applies to a directory that is not in a repository", func(t *testing.T) {
+		scratch := filepath.Join(root, "private", "scratch")
+		if err := os.MkdirAll(scratch, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("GIT_CEILING_DIRECTORIES", root)
+		check(t, scratch, "user")
+	})
 	t.Run("a linked worktree on a release branch uses the branch rule while the main worktree keeps the repository rule", func(t *testing.T) {
 		linked := filepath.Join(root, "api-release")
 		git(t, api, "worktree", "add", "-b", "release/1.0", linked)

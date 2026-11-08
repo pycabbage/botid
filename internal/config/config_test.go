@@ -443,8 +443,8 @@ func TestSelect(t *testing.T) {
 		{"no rule matches", repo.Info{Path: "/work/bar", Branch: "main", Remotes: []string{"github.com/foo/bar"}}, "acme-bot"},
 		{"no remotes", repo.Info{Path: "/work/local", Branch: "main"}, "acme-bot"},
 		{"any remote may match", repo.Info{Path: "/work/fork", Branch: "main", Remotes: []string{"github.com/me/fork", "github.com/octocorp/api"}}, "octocorp-bot"},
-		{"outside a repository", repo.Info{}, "acme-bot"},
-		{"outside a repository ignores a branch", repo.Info{Branch: "release/1"}, "acme-bot"},
+		{"outside a repository", repo.Info{Path: "/work/notes"}, "acme-bot"},
+		{"outside a repository, in a directory that a path rule names", repo.Info{Path: "/home/alice/src/private/notes"}, "user"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -577,6 +577,37 @@ func TestSelectPathRuleResolvesSymlinksOnBothSides(t *testing.T) {
 			t.Errorf("Select = %q, want user", got)
 		}
 	})
+}
+
+func TestSelectPathRuleWithoutGlobMatchesOnlyThatRepository(t *testing.T) {
+	c := Config{
+		Default: "default-bot",
+		Rules: []Rule{
+			{Remote: "github.com/example-org/*", Identity: "org-bot"},
+			{Path: "~/work/project-main", Identity: "org-bot"},
+		},
+	}
+	tests := []struct {
+		name string
+		info repo.Info
+		want string
+	}{
+		{"a directory at that path that is not in a repository", repo.Info{Path: "/home/alice/work/project-main"}, "org-bot"},
+		{"the repository at that path, without remotes", repo.Info{Path: "/home/alice/work/project-main", Branch: "main"}, "org-bot"},
+		{"the repository at that path, with another remote", repo.Info{Path: "/home/alice/work/project-main", Branch: "main", Remotes: []string{"github.com/alice/fork"}}, "org-bot"},
+		{"a repository whose name only starts the same", repo.Info{Path: "/home/alice/work/project-main-2", Branch: "main"}, "default-bot"},
+		{"a repository below that path", repo.Info{Path: "/home/alice/work/project-main/sub", Branch: "main"}, "default-bot"},
+		{"a worktree directory is judged by the path of its main worktree", repo.Info{Path: "/home/alice/work/project", Branch: "main", Remotes: []string{"github.com/alice/fork"}}, "default-bot"},
+		{"a worktree directory still follows the remote rule", repo.Info{Path: "/home/alice/work/project", Branch: "main", Remotes: []string{"github.com/example-org/app"}}, "org-bot"},
+		{"another directory that is not in a repository", repo.Info{Path: "/home/alice/work/other"}, "default-bot"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := c.Select(tt.info, "/home/alice"); got != tt.want {
+				t.Errorf("Select = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
 
 func TestSelectPathRuleExpandsTildeWithTheGivenHome(t *testing.T) {
