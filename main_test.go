@@ -38,7 +38,11 @@ func runWith(t *testing.T, home, stdin string, args ...string) result {
 			Stdout: &stdout,
 			Stderr: &stderr,
 			Exe:    func() (string, error) { return "/opt/botid/bin/botid", nil },
-			Git: func(_ context.Context, dir string, _ ...string) ([]byte, error) {
+			Git: func(_ context.Context, dir string, args ...string) ([]byte, error) {
+				if len(args) > 0 && args[0] == "config" {
+					return []byte("user.name\nbot[bot]\x00user.email\n1+bot[bot]@users.noreply.github.com\x00" +
+						"credential.https://github.com.helper\n!/usr/bin/gh auth git-credential\x00"), nil
+				}
 				r.gitDirs = append(r.gitDirs, dir)
 				return nil, &repo.ExitError{Code: 128, Stderr: "fatal: not a git repository (or any of the parent directories): .git\n"}
 			},
@@ -56,6 +60,24 @@ func writeConfig(t *testing.T, home string, c config.Config) {
 	}
 	if err := config.Save(filepath.Join(dir, "config.json"), c); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// markComplete gives the identity what botid init leaves: a hosts.yml and a git config file with every setting.
+// runWith's Git answers the questions about a repository only, so it reports that this file has every setting.
+func markComplete(t *testing.T, home, name string) {
+	t.Helper()
+	dir := filepath.Join(home, ".local", "share", "botid", "identities", name)
+	for file, content := range map[string]string{
+		filepath.Join(dir, "gh", "hosts.yml"): "hosts\n",
+		filepath.Join(dir, "git", "config"):   "[user]\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -263,6 +285,7 @@ func TestEnvPrintsTheDefaultIdentityWithExitCode0(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			home := t.TempDir()
 			writeConfig(t, home, botConfig("bot"))
+			markComplete(t, home, "bot")
 
 			r := runWith(t, home, "", tt.args...)
 
@@ -296,6 +319,7 @@ func TestEnvForTheUserIdentityPrintsNothing(t *testing.T) {
 func TestEnvPassesCwdToGit(t *testing.T) {
 	home := t.TempDir()
 	writeConfig(t, home, botConfig("bot"))
+	markComplete(t, home, "bot")
 	if err := os.MkdirAll(filepath.Join(home, "proj", "sub"), 0o755); err != nil {
 		t.Fatal(err)
 	}

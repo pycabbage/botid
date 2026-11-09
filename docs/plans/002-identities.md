@@ -331,7 +331,7 @@ Prompts and the choice of installation are those of 001 §6.3. The differences a
 2. Read `Client ID: ` and the private key, parse the key, choose the installation, and issue a token. Nothing is written before this succeeds.
 3. The identity name is the slug from `GET /app`. If the slug fails `ValidName` or equals `user`, end with an error that names the slug (§11, L9).
 4. If the config already has an identity with that name, warn `Warning: identity "<name>" already exists in <path>. If you continue, its credentials and private key will be overwritten.` and ask `Overwrite? [y/n]: `. Anything other than `y` changes nothing and exits with 0.
-5. Write, in this order: `identities/<name>/private-key.pem` (config side), `gh/hosts.yml`, then the git setup of 001 §6.3 step 7 against the identity's `git/` and `gh/` directories (bot user id, `user.name`, `user.email`, `gh auth setup-git`), and last `config.json` with the identity added or replaced. The config is written last so that it never refers to an identity whose files are incomplete.
+5. Write, in this order, while holding the lock of §7.6: `identities/<name>/private-key.pem` (config side), `gh/hosts.yml`, then all of the git settings of §7.6 against the identity's `git/` and `gh/` directories (`user.name`, `user.email`, `gh auth setup-git`), and last `config.json` with the identity added or replaced. The config is written last so that it never refers to an identity whose files are incomplete.
 6. When `config.json` did not exist, the new identity is also the `default`. In every other case (including a migrated file) `default` and `rules` are kept as they are.
 7. Register the systemd timer as in 001 §8. It is idempotent.
 8. Print what was done: the identity name, whether it is the default, and that rules are assigned by editing `config.json`, with its path. The line "Run botid env and set the printed environment variables once..." is removed.
@@ -343,7 +343,7 @@ If a step after 5 fails, written files are not rolled back, as in 001.
 1. Load `config.json`. A missing file gives `<path> does not exist; run botid init`. A v0.1.0 file is migrated first (§7.5).
 2. For each App identity, in sorted name order:
    1. If `installationId` is 0: `has no installationId; run botid init again`.
-   2. Read the key, issue the token (001 §7), build the hosts.yml content, `EnsureDir` the identity's data and `gh/` directories, and replace `hosts.yml` atomically (0600).
+   2. Read the key and issue the token (001 §7). Then, holding the lock of §7.6, build the hosts.yml content, `EnsureDir` the identity's data and `gh/` directories, replace `hosts.yml` atomically (0600), and add the git settings that the identity's git config file lacks (§7.6). It prints `botid: identity "<name>": added <settings> to <git config file>` to stderr when it added any.
 3. A failure for one identity does not stop the others. The errors are collected in name order, each prefixed with `identity "<name>": `, joined with `errors.Join`, and the command exits with 1 when there is any.
 
 With no App identity (only `user`), the command does nothing and exits with 0.
@@ -353,11 +353,12 @@ With no App identity (only `user`), the command does nothing and exits with 0.
 1. Load `config.json` (same errors as `issue`).
 2. `DIR` defaults to the working directory of the process. `~` and `~/x` are expanded with `$HOME`. A relative path is joined to the working directory of the process. The result is cleaned.
 3. `repo.Inspect(ctx, a.Git, DIR)`, then `Config.Select(info, a.Home)`.
-4. Print to stdout:
+4. If the selected identity is an App identity, check that it is complete and complete it when it is not (§7.6). The `user` identity is not checked. A failure ends the command with exit code 1, so the plugin's shell command does not run under an identity that is half set up.
+5. Print to stdout:
    - App identity, `dotenv`: `GH_CONFIG_DIR='…/identities/<name>/gh'` and `GIT_CONFIG_GLOBAL='…/identities/<name>/git/config'` in the quoting of 001 §6.2.
    - App identity, `json`: the same two variables as one JSON object and a newline.
    - `user` identity: nothing for `dotenv`, `{}` and a newline for `json`.
-5. Nothing is printed to stderr on success. On failure the error goes to stderr with exit code 1, and stdout stays empty.
+6. Nothing is printed to stderr on success, except the notice of §7.6 when the check completed the identity. On failure the error goes to stderr with exit code 1, and stdout stays empty.
 
 `dotenv` is the default format, so `botid env` keeps its v0.1.0 output form. `--cwd` and `--format` exist so the plugin (§8) can hand over the command's directory and get JSON back without parsing code.
 
@@ -381,6 +382,32 @@ With no App identity (only `user`), the command does nothing and exits with 0.
 7. Print to stderr `botid: migrated <path> from the format of botid v0.1.0; the identity "<slug>" is the default`, and `botid: moved <old> to <new>` for each directory that was moved. Nothing goes to stdout, so the output of `env` stays parseable.
 
 An error in steps 2 to 6 is returned as `cannot migrate <path> from the format of botid v0.1.0: <reason> (to discard the old configuration instead, remove the file and run botid init)`. The old `config.json` is not changed in that case, and every step is safe to repeat: a second run skips the directories that the first run moved, and issues a new token. The private key is never moved or deleted, so a failed run cannot lose it.
+
+The migration does not check the git settings. The command that triggered it does that next (§7.6), so a v0.1.0 identity whose git config file was complete is left alone, and one whose file lacks a setting is completed.
+
+### 7.6 Keeping an App identity complete
+
+`botid init` is the only command that used to write the git config file of an identity (`GIT_CONFIG_GLOBAL`), so a `config.json` written by hand, or a file that `gh auth setup-git` alone has touched, left it missing or short of `user.name` and `user.email`. Every command other than `help` and `version` now checks the identity that it is about to use, and completes it.
+
+What `init` writes, and what the check looks for, in the git config file of the identity:
+
+| Setting | Written by | Present when |
+| --- | --- | --- |
+| `user.name` | `git config --global user.name <slug>[bot]` | `git config --file <file> --list -z` has a non-empty `user.name` |
+| `user.email` | `git config --global user.email <id>+<slug>[bot]@users.noreply.github.com` | the same listing has a non-empty `user.email` |
+| credential helper | `gh auth setup-git` | the listing has a `credential.https://github.com.helper` value that contains `auth git-credential` |
+
+An identity is **complete** when its `hosts.yml` exists and all three settings are present. `git` parses the file, so quoting and case follow git. A file that does not exist has none of the settings.
+
+- **`botid env`** checks the identity that it selects, and only that one, with local reads and no request. If the identity is complete, it adds nothing, and the plugin's per-command cost stays at one `botid` process, three git processes for the repository, and one more for the config file. If it is not complete, it issues a token (a request for the installation token and for the App), writes the `hosts.yml`, and adds only the missing settings. `user.email` needs the bot user's ID (one more request); `user.name` needs none, because the slug is already known. A failure ends the command with exit code 1 and an error that names the identity.
+- **`botid issue`** renews the `hosts.yml` of every App identity as before, and after that adds the missing settings the same way. A complete identity costs no request beyond the token.
+- **`botid init`** writes all three settings, as before, through the same code.
+- **Only what is missing is added.** A value that the user changed (for example another `user.name`) stays, and so does a credential helper that is already there. `gh auth setup-git` runs only when the helper is missing, so it does not add a second copy.
+- **One writer at a time.** The check, the write of `hosts.yml` and the git settings run while holding an exclusive `flock` on the configuration directory. Commands that start together (the plugin runs one `botid env` per shell command, and the timer runs `botid issue`) queue, and the later ones find the identity complete. `issue` requests its token before it takes the lock, so the lock covers local work. `env` requests inside the lock on purpose, so that eight shell commands that start together cause one token request, not eight.
+- **A notice on stderr.** When a command completed an identity, it prints `botid: identity "<name>" was incomplete; wrote <hosts.yml>[ and added <settings> to <git config file>]` (`env`), or `botid: identity "<name>": added <settings> to <git config file>` (`issue`). It prints nothing when there was nothing to do.
+- **The `user` identity is never touched.**
+
+Limits of the check: it tells that a setting is present, not that its value is right, and it does not look at the token, which `issue` renews every 45 minutes. A `hosts.yml` that exists with an expired token is not repaired by `env`; the timer does that. An identity whose `hosts.yml` is missing is repaired by `env` at the first use.
 
 ## 8. OpenCode plugin
 
@@ -431,6 +458,7 @@ Each stage ends with `go vet ./...` and `go test ./...` passing. Stages 3 and 4 
    - `Issue`: every identity gets its `hosts.yml`; one failing identity does not stop the others, the others are written, the exit code is 1 and the message names the failing identity; no App identity is a no-op; a missing file gives the message of §7.2; a v0.1.0 file is migrated and then issued.
     - Migration (§7.5): `env` migrates a v0.1.0 file and prints the identity's variables; an inline key is kept; missing `gh/` and `git/` directories are skipped; each failure (`installationId` unset, missing key file, GitHub rejects the credentials, an App slug that is not a valid name) leaves every old file as it was; a run that stopped at a non-empty destination finishes when repeated; eight commands that start together migrate once (one token request) and all print the same output.
    - `Env`: the selected identity's two variables in both formats; `user` prints nothing / `{}`; `--cwd` relative, absolute and with `~`; the default `cwd`; a missing config; stdout stays empty on failure.
+    - Keeping an identity complete (§7.6): `env` and `issue` add each missing setting alone and in combination, with the expected `git` and `gh` calls, requests and notice; a value that the user changed stays; an empty value counts as missing; another credential helper is not mistaken for gh's; a complete identity causes no write, no external command, no request (`env`) and no notice; only the selected identity is completed; the `user` identity is not touched; each failure (GitHub, key, `installationId`, git, reading the config file) ends `env` with an error that names the identity and an empty stdout; eight `env` commands that start together complete the identity once. With real `git` and `gh` against a fake GitHub: a hand-written config is completed by the first command and left alone by the second, a changed `user.name` stays while a removed `user.email` comes back, and after a manual `gh auth setup-git` the next command adds `user.name` and `user.email`.
    - `main`: `env` flags, an unknown flag, a bad `--format`, extra arguments for `init` and `issue`, exit codes.
    - The tests of `internal/integration` use `paths.New(home).Identity(name)`.
 5. Plugin: replace `plugin/opencode/botid.ts` with §8.
@@ -479,8 +507,10 @@ Not possible without credentials of a real GitHub App: that `init` and `issue` w
 - **L8.** `botid env` needs git 2.36 or newer (`worktree list -z`). An older git makes `Inspect` fail with git's message.
 - **L9.** The App slug `user` cannot be used, because the name is reserved. `init` stops with an error.
 - **L10.** Two `init` runs at the same moment can lose one update of `config.json` (read, modify, write). `init` is interactive.
-- **L11.** Every shell command costs one `botid` process and three git processes. The cost is measured in §12.
+- **L11.** Every shell command costs one `botid` process, three git processes for the repository, and one git process for the config file of an App identity. The cost is measured in §12.
 - **L12.** The migration of a v0.1.0 file (§7.5) needs the network once. Until it succeeds, `env` fails and the plugin blocks every shell command (fail-closed, L4). The error message names the reason. Removing the old `config.json` and running `botid init` discards the old configuration instead.
+- **L13.** Completing an incomplete identity (§7.6) needs the network and the private key. While it fails, `env` fails and the plugin blocks every shell command that selects that identity (fail-closed, L4). Shell commands that select another identity, or `user`, are not affected.
+- **L14.** `env` reads the git config file with `git config --file ... --list -z`, which does not follow `include` directives. A setting that the user put in an included file counts as missing, and `env` adds it to the file itself.
 
 ## 12. Items to settle by measurement during implementation
 

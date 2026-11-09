@@ -27,7 +27,7 @@ type App struct {
 	Stdout io.Writer
 	Stderr io.Writer
 	Client func(clientID string, key *rsa.PrivateKey) *ghapp.Client
-	// Exec runs the git and gh commands of init.
+	// Exec runs the git and gh commands that set up the git config file of an identity.
 	Exec func(ctx context.Context, env []string, name string, args ...string) ([]byte, error)
 	// Git runs the git commands of env.
 	Git     repo.Runner
@@ -64,16 +64,26 @@ func ensureDirs(dirs ...string) error {
 }
 
 func (a *App) runTool(ctx context.Context, env []string, name string, args ...string) error {
+	_, err := a.output(ctx, env, name, args...)
+	return err
+}
+
+// output runs the command with Exec and returns what it printed. A failure names the command and carries what it printed.
+func (a *App) output(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
 	out, err := a.Exec(ctx, env, name, args...)
 	if err == nil {
-		return nil
+		return out, nil
 	}
 	if errors.Is(err, exec.ErrNotFound) {
-		return fmt.Errorf("%s not found; install it and add it to PATH: %w", name, err)
+		return nil, fmt.Errorf("%s not found; install it and add it to PATH: %w", name, err)
 	}
 	cmdline := strings.Join(append([]string{name}, args...), " ")
 	if msg := strings.TrimSpace(string(out)); msg != "" {
-		return fmt.Errorf("%s failed: %w\n%s", cmdline, err, msg)
+		return nil, fmt.Errorf("%s failed: %w\n%s", cmdline, err, msg)
 	}
-	return fmt.Errorf("%s failed: %w", cmdline, err)
+	return nil, fmt.Errorf("%s failed: %w", cmdline, err)
+}
+
+func (a *App) notef(format string, args ...any) {
+	_, _ = fmt.Fprintf(a.Stderr, "botid: "+format+"\n", args...)
 }

@@ -95,11 +95,17 @@ func (a *App) Init(ctx context.Context) error {
 	}
 
 	id := p.Identity(name)
-	if err := writeIdentity(p, id, pemBytes, hosts); err != nil {
+	botName := name + "[bot]"
+	if err := ensureDirs(p.ConfigDir); err != nil {
 		return err
 	}
-	botName := name + "[bot]"
-	if err := a.setupGit(ctx, id, client, cred, botName); err != nil {
+	err = withLock(p, func() error {
+		if err := writeIdentity(p, id, pemBytes, hosts); err != nil {
+			return err
+		}
+		return a.applyGit(ctx, id, client, cred, allGitSettings)
+	})
+	if err != nil {
 		return err
 	}
 	isDefault := fresh || c.Default == name
@@ -241,25 +247,6 @@ func writeIdentity(p paths.Paths, id paths.Identity, pemBytes, hosts []byte) err
 		return fmt.Errorf("cannot write %s: %w", id.HostsFile, err)
 	}
 	return nil
-}
-
-func (a *App) setupGit(ctx context.Context, id paths.Identity, client *ghapp.Client, cred ghapp.Credential, botName string) error {
-	if err := ensureDirs(id.GitConfigDir); err != nil {
-		return err
-	}
-	userID, err := client.BotUserID(ctx, cred.Token, cred.Slug)
-	if err != nil {
-		return err
-	}
-	env := []string{"GH_CONFIG_DIR=" + id.GHConfigDir, "GIT_CONFIG_GLOBAL=" + id.GitConfigFile}
-	email := fmt.Sprintf("%d+%s@users.noreply.github.com", userID, botName)
-	if err := a.runTool(ctx, env, "git", "config", "--global", "user.name", botName); err != nil {
-		return err
-	}
-	if err := a.runTool(ctx, env, "git", "config", "--global", "user.email", email); err != nil {
-		return err
-	}
-	return a.runTool(ctx, env, "gh", "auth", "setup-git")
 }
 
 func readLine(in *bufio.Reader) (string, error) {

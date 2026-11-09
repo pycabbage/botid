@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/pycabbage/botid/internal/config"
 	"github.com/pycabbage/botid/internal/ghapp"
@@ -12,7 +13,8 @@ import (
 	"github.com/pycabbage/botid/internal/store"
 )
 
-// Issue replaces the hosts.yml of every App identity. A failure for one identity does not stop the others.
+// Issue replaces the hosts.yml of every App identity and adds the git settings that its git config file lacks.
+// A failure for one identity does not stop the others.
 func (a *App) Issue(ctx context.Context) error {
 	p := paths.New(a.Home)
 	c, err := a.loadConfig(ctx, p)
@@ -30,18 +32,24 @@ func (a *App) Issue(ctx context.Context) error {
 }
 
 func (a *App) issueIdentity(ctx context.Context, p paths.Paths, name string, ident config.Identity) error {
-	if ident.InstallationID == 0 {
-		return errors.New("has no installationId; run botid init again")
-	}
-	key, err := ident.Key()
+	client, cred, err := a.issueCredential(ctx, ident)
 	if err != nil {
 		return err
 	}
-	cred, err := a.Client(ident.ClientID, key).Issue(ctx, ident.InstallationID)
+	id := p.Identity(name)
+	var added []string
+	err = withLock(p, func() error {
+		var err error
+		added, err = a.completeIdentity(ctx, p, id, client, cred)
+		return err
+	})
 	if err != nil {
 		return err
 	}
-	return writeHosts(p, p.Identity(name), cred)
+	if len(added) > 0 {
+		a.notef("identity %q: added %s to %s", name, strings.Join(added, ", "), id.GitConfigFile)
+	}
+	return nil
 }
 
 // writeHosts replaces the hosts.yml of one identity with the credential.

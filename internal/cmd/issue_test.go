@@ -2,7 +2,9 @@ package cmd_test
 
 import (
 	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
@@ -70,9 +72,10 @@ func TestIssueWritesHostsYML(t *testing.T) {
 	h.assertNoOutputLeaksToken()
 }
 
-func TestIssueRunsNoExternalCommandAndSkipsInstallationList(t *testing.T) {
+func TestIssueRunsNoExternalCommandAndSkipsInstallationListWhenTheIdentityIsComplete(t *testing.T) {
 	h := newHarness(t, "", ghapp.Installation{ID: 42, Login: "alice"}, ghapp.Installation{ID: 43, Login: "acme"})
 	h.writeIssueConfig(42)
+	h.markGitComplete(h.git, "my-app")
 
 	if err := h.app.Issue(context.Background()); err != nil {
 		t.Fatalf("Issue: %v", err)
@@ -84,6 +87,210 @@ func TestIssueRunsNoExternalCommandAndSkipsInstallationList(t *testing.T) {
 	}
 	if got := h.rec.lines(); len(got) != 0 {
 		t.Errorf("external commands were run: %v", got)
+	}
+	if got := h.stderr.String(); got != "" {
+		t.Errorf("stderr = %q, want empty", got)
+	}
+}
+
+func TestIssueCompletesAnIncompleteGitConfig(t *testing.T) {
+	gitConfig := ".local/share/botid/identities/my-app/git"
+	env := func(h *harness) []string {
+		return []string{
+			"GH_CONFIG_DIR=" + h.identityDataPath("my-app", "gh"),
+			"GIT_CONFIG_GLOBAL=" + h.gitConfigPath("my-app"),
+		}
+	}
+	tests := []struct {
+		name      string
+		listing   string
+		fileExist bool
+		wantCalls []string
+		wantReqs  []string
+		wantAdded string
+	}{
+		{
+			name:      "no git config file at all",
+			wantCalls: []string{"git config --global user.name my-app[bot]", "git config --global user.email " + botEmail, "gh auth setup-git"},
+			wantReqs:  []string{"POST /app/installations/42/access_tokens", "GET /app", "GET /users/my-app%5Bbot%5D"},
+			wantAdded: "user.name, user.email, the gh credential helper",
+		},
+		{
+			name:      "only the credential helper, as after a manual gh auth setup-git",
+			listing:   gitListing("", "", true),
+			fileExist: true,
+			wantCalls: []string{"git config --global user.name my-app[bot]", "git config --global user.email " + botEmail},
+			wantReqs:  []string{"POST /app/installations/42/access_tokens", "GET /app", "GET /users/my-app%5Bbot%5D"},
+			wantAdded: "user.name, user.email",
+		},
+		{
+			name:      "user.name and email, no credential helper",
+			listing:   gitListing("my-app[bot]", botEmail, false),
+			fileExist: true,
+			wantCalls: []string{"gh auth setup-git"},
+			wantReqs:  []string{"POST /app/installations/42/access_tokens", "GET /app"},
+			wantAdded: "the gh credential helper",
+		},
+		{
+			name:      "user.name is missing",
+			listing:   gitListing("", botEmail, true),
+			fileExist: true,
+			wantCalls: []string{"git config --global user.name my-app[bot]"},
+			wantReqs:  []string{"POST /app/installations/42/access_tokens", "GET /app"},
+			wantAdded: "user.name",
+		},
+		{
+			name:      "user.email is missing",
+			listing:   gitListing("my-app[bot]", "", true),
+			fileExist: true,
+			wantCalls: []string{"git config --global user.email " + botEmail},
+			wantReqs:  []string{"POST /app/installations/42/access_tokens", "GET /app", "GET /users/my-app%5Bbot%5D"},
+			wantAdded: "user.email",
+		},
+		{
+			name:      "an empty git config file",
+			fileExist: true,
+			wantCalls: []string{"git config --global user.name my-app[bot]", "git config --global user.email " + botEmail, "gh auth setup-git"},
+			wantReqs:  []string{"POST /app/installations/42/access_tokens", "GET /app", "GET /users/my-app%5Bbot%5D"},
+			wantAdded: "user.name, user.email, the gh credential helper",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, "", ghapp.Installation{ID: 42, Login: "alice"})
+			h.writeIssueConfig(42)
+			if tt.fileExist {
+				h.writeGitConfigFile(h.git, "my-app", tt.listing)
+			}
+
+			if err := h.app.Issue(context.Background()); err != nil {
+				t.Fatalf("Issue: %v", err)
+			}
+
+			if got := h.rec.lines(); !equalLines(got, tt.wantCalls) {
+				t.Errorf("external commands =\n%v\nwant\n%v", got, tt.wantCalls)
+			}
+			for _, c := range h.rec.calls {
+				if !equalLines(c.Env, env(h)) {
+					t.Errorf("env passed to %s = %v, want %v", c.line(), c.Env, env(h))
+				}
+			}
+			if got := h.gh.requests(); !equalLines(got, tt.wantReqs) {
+				t.Errorf("GitHub requests = %v, want %v", got, tt.wantReqs)
+			}
+			if got := h.read(hostsPath); got != wantHosts {
+				t.Errorf("hosts.yml = %q, want %q", got, wantHosts)
+			}
+			if m := h.mode(gitConfig); m != 0o700 {
+				t.Errorf("git directory mode = %o, want 700", m)
+			}
+			want := `botid: identity "my-app": added ` + tt.wantAdded + " to " + h.gitConfigPath("my-app") + "\n"
+			if got := h.stderr.String(); got != want {
+				t.Errorf("stderr = %q, want %q", got, want)
+			}
+			h.assertNoOutputLeaksToken()
+		})
+	}
+}
+
+func TestIssueKeepsAValueTheUserChanged(t *testing.T) {
+	h := newHarness(t, "", ghapp.Installation{ID: 42, Login: "alice"})
+	h.writeIssueConfig(42)
+	h.writeGitConfigFile(h.git, "my-app", gitListing("My Own Name", "me@example.com", false))
+
+	if err := h.app.Issue(context.Background()); err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	if got, want := h.rec.lines(), []string{"gh auth setup-git"}; !equalLines(got, want) {
+		t.Errorf("external commands = %v, want only %v", got, want)
+	}
+	for _, r := range h.gh.requests() {
+		if strings.HasPrefix(r, "GET /users/") {
+			t.Errorf("request %q was sent although user.email is set", r)
+		}
+	}
+}
+
+func TestIssueTreatsAnEmptyValueAsMissing(t *testing.T) {
+	h := newHarness(t, "", ghapp.Installation{ID: 42, Login: "alice"})
+	h.writeIssueConfig(42)
+	h.writeGitConfigFile(h.git, "my-app", "user.name\n\x00user.email\n\x00"+gitListing("", "", true))
+
+	if err := h.app.Issue(context.Background()); err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	want := []string{"git config --global user.name my-app[bot]", "git config --global user.email " + botEmail}
+	if got := h.rec.lines(); !equalLines(got, want) {
+		t.Errorf("external commands = %v, want %v", got, want)
+	}
+}
+
+func TestIssueDoesNotMistakeAnotherHelperForTheGhHelper(t *testing.T) {
+	h := newHarness(t, "", ghapp.Installation{ID: 42, Login: "alice"})
+	h.writeIssueConfig(42)
+	other := "user.name\nmy-app[bot]\x00user.email\n" + botEmail + "\x00credential.https://github.com.helper\n!/usr/bin/other-helper get\x00"
+	h.writeGitConfigFile(h.git, "my-app", other)
+
+	if err := h.app.Issue(context.Background()); err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	if got, want := h.rec.lines(), []string{"gh auth setup-git"}; !equalLines(got, want) {
+		t.Errorf("external commands = %v, want %v", got, want)
+	}
+}
+
+func TestIssueStopsForTheIdentityWhenAGitStepFails(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(h *harness)
+		want  string
+	}{
+		{
+			"git config fails",
+			func(h *harness) {
+				h.rec.errs["git config --global user.name my-app[bot]"] = errors.New("exit status 128")
+				h.rec.out["git config --global user.name my-app[bot]"] = "fatal: cannot write\n"
+			},
+			"git config --global user.name my-app[bot] failed",
+		},
+		{
+			"gh is not installed",
+			func(h *harness) {
+				h.rec.errs["gh auth setup-git"] = &exec.Error{Name: "gh", Err: exec.ErrNotFound}
+			},
+			"gh not found; install it and add it to PATH",
+		},
+		{
+			"GitHub does not know the bot user",
+			func(h *harness) {
+				h.gh.fail["GET /users/my-app%5Bbot%5D"] = 404
+			},
+			"getting bot user ID",
+		},
+		{
+			"reading the git config file fails",
+			func(h *harness) {
+				h.writeGitConfigFile(h.git, "my-app", "")
+				h.git.errs["config --file "+h.gitConfigPath("my-app")+" --list -z"] = errors.New("exit status 128")
+			},
+			"/.local/share/botid/identities/my-app/git/config: exit status 128",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, "", ghapp.Installation{ID: 42, Login: "alice"})
+			h.writeIssueConfig(42)
+			tt.setup(h)
+
+			err := h.app.Issue(context.Background())
+
+			if err == nil || !strings.HasPrefix(err.Error(), `identity "my-app": `) || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want it to name the identity and contain %q", err, tt.want)
+			}
+		})
 	}
 }
 
@@ -156,6 +363,7 @@ func TestIssueWritesEveryAppIdentityWithItsOwnToken(t *testing.T) {
 		},
 		Rules: []config.Rule{{Remote: "github.com/*/*", Identity: "user"}},
 	})
+	h.markGitComplete(h.git, "alpha", "beta")
 
 	if err := h.app.Issue(context.Background()); err != nil {
 		t.Fatalf("Issue: %v", err)

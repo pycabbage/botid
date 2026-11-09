@@ -76,6 +76,21 @@ func (g *githubFake) tokenFor(id int64) string {
 	return testToken
 }
 
+// acceptsBearer reports whether the Authorization header carries a token that the fake has issued.
+func (g *githubFake) acceptsBearer(auth string) bool {
+	if auth == "Bearer "+testToken {
+		return true
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, token := range g.tokens {
+		if auth == "Bearer "+token {
+			return true
+		}
+	}
+	return false
+}
+
 func (g *githubFake) requests() []string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -111,7 +126,7 @@ func (g *githubFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "GET /app":
 		writeJSON(w, 200, `{"slug":"`+slug+`"}`)
 	case "GET /users/" + slug + "%5Bbot%5D":
-		if auth != "Bearer "+testToken {
+		if !g.acceptsBearer(auth) {
 			writeJSON(w, 401, `{"message":"Bad credentials"}`)
 			return
 		}
@@ -143,6 +158,8 @@ type recorder struct {
 	calls []call
 	errs  map[string]error
 	out   map[string]string
+	// after runs when an exec call has succeeded.
+	after func(c call)
 }
 
 func (r *recorder) record(ctx context.Context, env []string, name string, args []string) ([]byte, error) {
@@ -154,7 +171,11 @@ func (r *recorder) record(ctx context.Context, env []string, name string, args [
 }
 
 func (r *recorder) exec(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
-	return r.record(ctx, env, name, args)
+	out, err := r.record(ctx, env, name, args)
+	if err == nil && r.after != nil {
+		r.after(call{Env: env, Name: name, Args: args})
+	}
+	return out, err
 }
 
 func (r *recorder) systemctl(ctx context.Context, name string, args ...string) ([]byte, error) {
@@ -179,6 +200,7 @@ type harness struct {
 	stderr *bytes.Buffer
 	gh     *githubFake
 	rec    *recorder
+	git    *fakeGit
 
 	mu        sync.Mutex
 	clientIDs []string
@@ -196,7 +218,9 @@ func newHarness(t *testing.T, stdin string, installs ...ghapp.Installation) *har
 		stderr: &bytes.Buffer{},
 		gh:     &githubFake{installs: installs, fail: map[string]int{}, slug: testSlug, tokens: map[int64]string{}},
 		rec:    &recorder{errs: map[string]error{}, out: map[string]string{}},
+		git:    &fakeGit{out: map[string]string{}, errs: map[string]error{}},
 	}
+	h.rec.after = h.applyGitCall
 	srv := httptest.NewServer(h.gh)
 	t.Cleanup(srv.Close)
 
@@ -213,10 +237,137 @@ func newHarness(t *testing.T, stdin string, installs ...ghapp.Installation) *har
 			return &ghapp.Client{BaseURL: srv.URL, ClientID: clientID, Key: key}
 		},
 		Exec:    h.rec.exec,
+		Git:     h.git.run,
 		Systemd: h.rec.systemctl,
 		Exe:     func() (string, error) { return fakeExe, nil },
 	}
 	return h
+}
+
+const (
+	gitHelperValue = "!/usr/bin/gh auth git-credential"
+	botEmail       = "123456+my-app[bot]@users.noreply.github.com"
+)
+
+// gitListing is what git config --list -z prints for a config file with the given settings.
+// name and email are the values, and an empty value means the setting is absent.
+func gitListing(name, email string, helper bool) string {
+	var b strings.Builder
+	if name != "" {
+		b.WriteString("user.name\n" + name + "\x00")
+	}
+	if email != "" {
+		b.WriteString("user.email\n" + email + "\x00")
+	}
+	if helper {
+		b.WriteString("credential.https://github.com.helper\n\x00")
+		b.WriteString("credential.https://github.com.helper\n" + gitHelperValue + "\x00")
+	}
+	return b.String()
+}
+
+var completeGitListing = gitListing("my-app[bot]", botEmail, true)
+
+func (h *harness) identityDataPath(name string, elem ...string) string {
+	return filepath.Join(append([]string{h.app.Home, ".local", "share", "botid", "identities", name}, elem...)...)
+}
+
+func (h *harness) gitConfigPath(name string) string {
+	return h.identityDataPath(name, "git", "config")
+}
+
+// setGitListing makes the fake git report listing for the git config file of the identity.
+func (h *harness) setGitListing(g *fakeGit, name, listing string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.out["config --file "+h.gitConfigPath(name)+" --list -z"] = listing
+}
+
+func (h *harness) writeFile(path, content string) {
+	h.t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		h.t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// writeGitConfigFile creates the git config file of the identity, which git then reports as listing.
+func (h *harness) writeGitConfigFile(g *fakeGit, name, listing string) {
+	h.t.Helper()
+	h.writeFile(h.gitConfigPath(name), "[user]\n")
+	h.setGitListing(g, name, listing)
+}
+
+// applyGitCall does to the git config file what a git or gh command of botid does, so that a later read finds the setting.
+// The git config file is the one in GIT_CONFIG_GLOBAL. A real git appends a value that it sets, and the last value wins.
+func (h *harness) applyGitCall(c call) {
+	var file string
+	for _, kv := range c.Env {
+		if v, ok := strings.CutPrefix(kv, "GIT_CONFIG_GLOBAL="); ok {
+			file = v
+		}
+	}
+	line := c.line()
+	var entry string
+	switch {
+	case file == "":
+		return
+	case strings.HasPrefix(line, "git config --global user.name "):
+		entry = "user.name\n" + strings.TrimPrefix(line, "git config --global user.name ") + "\x00"
+	case strings.HasPrefix(line, "git config --global user.email "):
+		entry = "user.email\n" + strings.TrimPrefix(line, "git config --global user.email ") + "\x00"
+	case line == "gh auth setup-git":
+		entry = "credential.https://github.com.helper\n\x00credential.https://github.com.helper\n" + gitHelperValue + "\x00"
+	default:
+		return
+	}
+	if _, err := os.Stat(file); err != nil {
+		h.writeFile(file, "[user]\n")
+	}
+	h.git.mu.Lock()
+	defer h.git.mu.Unlock()
+	h.git.out["config --file "+file+" --list -z"] += entry
+}
+
+// markGitComplete gives each identity a git config file that has every setting that botid init writes.
+func (h *harness) markGitComplete(g *fakeGit, names ...string) {
+	h.t.Helper()
+	for _, name := range names {
+		h.writeGitConfigFile(g, name, completeGitListing)
+	}
+}
+
+// markReady gives each identity what botid init leaves: a hosts.yml and a complete git config file.
+func (h *harness) markReady(g *fakeGit, names ...string) {
+	h.t.Helper()
+	for _, name := range names {
+		h.writeFile(h.identityDataPath(name, "gh", "hosts.yml"), "hosts of "+name+"\n")
+	}
+	h.markGitComplete(g, names...)
+}
+
+// snapshot returns every file and directory below the home directory with its contents.
+func (h *harness) snapshot() map[string]string {
+	h.t.Helper()
+	files := map[string]string{}
+	err := filepath.WalkDir(h.app.Home, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			files[path] = "<dir>"
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		files[path] = string(b)
+		return err
+	})
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return files
 }
 
 func (h *harness) path(elem ...string) string {

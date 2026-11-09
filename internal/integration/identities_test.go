@@ -105,7 +105,8 @@ func TestEnvSelectsTheIdentityForRealRepositoriesAndAppliesItToGhAndGit(t *testi
 		s := newSandboxFor(botidHome, name)
 		s.writeHostsFor(t, name+"-app", token)
 		s.ensureGitConfigDir(t)
-		git(t, root, "config", "--file", s.id.GitConfigFile, "user.email", name+"@example.com")
+		s.setGitUser(t, name+"-app[bot]", name+"@example.com")
+		s.mustRun(t, "", "gh", "auth", "setup-git")
 	}
 	if err := store.EnsureDir(p.ConfigDir); err != nil {
 		t.Fatal(err)

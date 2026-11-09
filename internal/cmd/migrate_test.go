@@ -36,6 +36,8 @@ func (h *harness) writeMigratableConfig() {
 	h.write(configPath, legacyBody(h.path(legacyKeyPath), 42))
 	h.write(legacyGH+"/hosts.yml", legacyHosts)
 	h.write(legacyGit+"/config", legacyGitConfig)
+	// botid v0.1.0 wrote a complete git config file, which the migration moves to the identity.
+	h.setGitListing(h.git, "my-app", completeGitListing)
 }
 
 func (h *harness) migratedConfig() config.Config {
@@ -59,6 +61,8 @@ func (h *harness) migrationNotice() string {
 	return h.migratedLine() + h.movedLine(legacyGH, identityData+"/gh") + h.movedLine(legacyGit, identityData+"/git")
 }
 
+// useWorkDir makes g answer the questions about the repository of the working directory,
+// and the harness's git answer the questions about the git config files of the identities.
 func (h *harness) useWorkDir(g *fakeGit) {
 	h.t.Helper()
 	work := h.path("work")
@@ -66,6 +70,10 @@ func (h *harness) useWorkDir(g *fakeGit) {
 		h.t.Fatal(err)
 	}
 	h.app.Cwd = work
+	for k, v := range h.git.out {
+		g.out[k] = v
+	}
+	h.git = g
 	h.app.Git = g.run
 }
 
@@ -172,9 +180,15 @@ func TestMigrationWithoutTheOldGhAndGitDirectories(t *testing.T) {
 	if got := h.read(identityData + "/gh/hosts.yml"); got != wantHosts {
 		t.Errorf("hosts.yml = %q, want %q", got, wantHosts)
 	}
-	h.assertGone(identityData + "/git")
-	if got := h.stderr.String(); got != h.migratedLine() {
-		t.Errorf("stderr = %q, want %q", got, h.migratedLine())
+	wantNotice := h.migratedLine() +
+		"botid: identity \"my-app\" was incomplete; wrote " + h.path(identityData, "gh", "hosts.yml") +
+		" and added user.name, user.email, the gh credential helper to " + h.gitConfigPath("my-app") + "\n"
+	if got := h.stderr.String(); got != wantNotice {
+		t.Errorf("stderr = %q, want %q", got, wantNotice)
+	}
+	wantCalls := []string{"git config --global user.name my-app[bot]", "git config --global user.email " + botEmail, "gh auth setup-git"}
+	if got := h.rec.lines(); !equalLines(got, wantCalls) {
+		t.Errorf("external commands = %v, want %v", got, wantCalls)
 	}
 }
 

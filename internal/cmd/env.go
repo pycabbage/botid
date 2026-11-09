@@ -33,7 +33,13 @@ func (a *App) Env(ctx context.Context, cwd, format string) error {
 		return err
 	}
 
-	out, err := envOutput(p, c.Select(info, a.Home), format)
+	name := c.Select(info, a.Home)
+	if name != config.User {
+		if err := a.ensureIdentity(ctx, p, c, name); err != nil {
+			return err
+		}
+	}
+	out, err := envOutput(p, name, format)
 	if err != nil {
 		return err
 	}
